@@ -1,0 +1,69 @@
+# Tiny test config — runs the full pipeline end-to-end in ~5 minutes on a 5070.
+# Use this to verify that all stages work together before committing to a
+# multi-hour real run.
+#
+# Differences from production configs:
+#   - Only 500 examples (vs ~30K in production)
+#   - Only 2 layers probed
+#   - 5 probe epochs (vs 50)
+#   - 100 RLACE steps (vs 500)
+#   - 50 Hessian power-iteration max (vs 100)
+#
+# To use:
+#   python -m scripts.run_model --config configs/tiny.yaml
+
+model:
+  name: "EleutherAI/pythia-160m"
+  trust_remote_code: false
+  dtype: "bfloat16"
+
+extraction:
+  batch_size: 32
+  max_length: 256
+  num_layers_to_probe: 2
+
+data:
+  paths:
+    - "data/numpred.train"
+    - "data/numpred.val"
+  max_examples: 500
+  val_frac: 0.4
+  inter_frac: 0.4
+  seed: 42
+
+probes:
+  hidden_dim: 128
+  epochs: 5
+  lr: 1.0e-3
+  weight_decay: 0.01
+  batch_size: 64
+
+mka:
+  knn_k: 5
+  lambda_reg: 0.1
+
+hessian:
+  top_n: 5
+  bottom_n: 5
+  max_iter: 50
+  tol: 1.0e-3
+
+interventions:
+  inlp:
+    num_iters: 5
+  rlace:
+    rank: 1
+    steps: 100
+  alterrep:
+    alpha: 1.0
+  fgsm:
+    epsilon: 0.5
+  pgd:
+    epsilon: 0.5
+    steps: 5
+    alpha: 0.1
+
+output:
+  results_dir: "results/tiny"
+  cache_dir: "cache/tiny"
+  seed: 42

@@ -1,0 +1,49 @@
+# Qwen2.5-1.5B - modern instruction-tuned model
+model:
+  name: "Qwen/Qwen2.5-1.5B"
+  trust_remote_code: false
+  dtype: "bfloat16"
+
+extraction:
+  batch_size: 32
+  max_length: 256
+  num_layers_to_probe: 5
+
+data:
+  paths:
+    - "data/numpred.train"
+    - "data/numpred.val"
+    - "data/numpred.test"
+  max_examples: 30000
+  val_frac: 0.4
+  inter_frac: 0.4
+  seed: 42
+
+probes:
+  hidden_dim: 256
+  epochs: 50
+  lr: 1.0e-3
+  weight_decay: 0.01
+  batch_size: 256
+
+mka:
+  knn_k: 10
+  lambda_reg: 0.1
+
+hessian:
+  top_n: 20
+  bottom_n: 20
+  max_iter: 100
+  tol: 1.0e-3
+
+interventions:
+  inlp: {num_iters: 10}
+  rlace: {rank: 1, steps: 500}
+  alterrep: {alpha: 1.0}
+  fgsm: {epsilon: 0.5}
+  pgd: {epsilon: 0.5, steps: 10, alpha: 0.1}
+
+output:
+  results_dir: "results/qwen-2.5-1.5b"
+  cache_dir: "cache/qwen-2.5-1.5b"
+  seed: 42
