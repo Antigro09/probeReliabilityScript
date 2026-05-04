@@ -1,0 +1,32 @@
+# Core ML
+# NOTE: For RTX 5070 (Blackwell), install PyTorch nightly with CUDA 12.8 separately:
+#   pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu128
+# For Lambda (A100/H100, CUDA 12.x), the standard install in this file works.
+torch>=2.5.0
+transformers>=4.45.0
+accelerate>=1.0.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0
+
+# Probing / Hessian / interventions
+pyhessian>=0.1
+scikit-learn>=1.5.0
+
+# NLP
+spacy>=3.7.0
+# Run after install: python -m spacy download en_core_web_sm
+
+# Data + analysis
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.13.0
+pyyaml>=6.0
+tqdm>=4.66.0
+datasets>=3.0.0   # for SST-2 download in tasks.py
+
+# Plotting
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# Reproducibility
+einops>=0.8.0
