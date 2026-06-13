@@ -72,6 +72,19 @@ def parse_args():
     return p.parse_args()
 
 
+def default_data_paths(task_name: str, cfg: dict) -> list[Path]:
+    """Return task-specific default data paths.
+
+    Model configs point at the original SVA files. Other tasks have their own
+    conventional filenames and handle missing data internally.
+    """
+    if task_name == "gender":
+        return [PROJECT_ROOT / "data" / "gender.tsv"]
+    if task_name == "sst2":
+        return [PROJECT_ROOT / "data" / "sst2.tsv"]
+    return [PROJECT_ROOT / p for p in cfg["data"]["paths"]]
+
+
 def make_probe(arch: str, dim: int, hidden_dim: int,
                mka_lambda: float, knn_k: int, seed: int):
     """Build a probe of the given architecture with seed-controlled init."""
@@ -188,7 +201,7 @@ def main():
         data_paths = [Path(p) if Path(p).is_absolute() else PROJECT_ROOT / p
                       for p in args.data_paths.split(",")]
     else:
-        data_paths = [PROJECT_ROOT / p for p in cfg["data"]["paths"]]
+        data_paths = default_data_paths(task.name, cfg)
 
     print(f"[data] task={task.name}  loading from {[str(p) for p in data_paths]}")
     examples = task.load(data_paths,

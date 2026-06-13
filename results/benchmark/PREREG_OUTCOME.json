@@ -1,0 +1,64 @@
+{
+  "thresholds": {
+    "P1_rho": 0.5,
+    "P1_p": 0.01,
+    "P2_hit_rate": 0.5,
+    "P3_rho": 0.4,
+    "P3_hit_rate": 0.4
+  },
+  "P1": {
+    "rho": -0.17014119217126306,
+    "p": 0.0050598051611264756,
+    "n": 270,
+    "threshold_rho": 0.5,
+    "threshold_p": 0.01,
+    "met": false
+  },
+  "P2": {
+    "hit_rate": 0.7666666666666667,
+    "n_hit": 69,
+    "n_total": 90,
+    "threshold": 0.5,
+    "met": true
+  },
+  "P3": {
+    "per_task": {
+      "gender": {
+        "rho": -0.2132381002799907,
+        "p": 0.043596540511209626,
+        "hit_rate": 0.9666666666666667,
+        "n_hit": 29,
+        "n_total": 30,
+        "rho_met": false,
+        "hr_met": true,
+        "met": false
+      },
+      "sst2": {
+        "rho": -0.20694812376312582,
+        "p": 0.05033799645859707,
+        "hit_rate": 0.7,
+        "n_hit": 21,
+        "n_total": 30,
+        "rho_met": false,
+        "hr_met": true,
+        "met": false
+      },
+      "sva": {
+        "rho": -0.008941509882971625,
+        "p": 0.933340657362254,
+        "hit_rate": 0.6333333333333333,
+        "n_hit": 19,
+        "n_total": 30,
+        "rho_met": false,
+        "hr_met": true,
+        "met": false
+      }
+    },
+    "threshold_rho": 0.4,
+    "threshold_hit_rate": 0.4,
+    "met": false
+  },
+  "outcome": "NEGATIVE",
+  "n_probes_total": 5400,
+  "n_cells": 270
+}

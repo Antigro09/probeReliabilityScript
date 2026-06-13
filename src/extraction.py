@@ -220,6 +220,7 @@ def _validate_extraction_position(
         padding=True,
         truncation=True,
         max_length=max_length,
+        add_special_tokens=False,
     )
     input_ids = encoded["input_ids"]
     attention_mask = encoded["attention_mask"]

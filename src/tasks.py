@@ -99,6 +99,11 @@ def _split_balanced_4cell(examples, val_frac, inter_frac, seed):
 
 def _split_balanced_zc_only(examples, val_frac, inter_frac, seed):
     """Fallback when (zc, ze) cells are uneven enough that 4-cell balance fails."""
+    if not examples:
+        raise ValueError(
+            "No examples were loaded for this task. Check the task data path "
+            "or install the task's download dependency."
+        )
     rng = random.Random(seed)
     by_zc: dict[int, list[Example]] = {}
     for ex in examples:
@@ -170,10 +175,11 @@ class GenderTask(Task):
 
     def load(self, paths, max_examples, seed):
         paths = [Path(p) for p in paths]
-        # Try to load from disk first
+        examples: list[Example] = []
         if any(p.exists() for p in paths):
             examples = self._load_from_files(paths)
-        else:
+        if not examples:
+            # No gender-format data found on disk; fall back to synthetic templates.
             examples = self._generate_synthetic(seed)
         rng = random.Random(seed)
         rng.shuffle(examples)
@@ -273,9 +279,10 @@ class SST2Task(Task):
 
     def load(self, paths, max_examples, seed):
         paths = [Path(p) for p in paths]
+        rows: list[tuple[str, int]] = []
         if any(p.exists() for p in paths):
             rows = self._load_from_files(paths)
-        else:
+        if not rows:
             rows = self._download_from_hub()
         rng = random.Random(seed)
         rng.shuffle(rows)
