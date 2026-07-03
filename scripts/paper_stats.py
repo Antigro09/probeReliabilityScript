@@ -1,27 +1,54 @@
 """Exploratory descriptive statistics for the paper write-up.
 
 NOT part of the pre-registered analysis (that is scripts/predictor_eval.py).
-This script aggregates the same 5,400 benchmark records into per-model,
-per-task, per-architecture, and per-layer-depth tables for reporting.
+This script aggregates benchmark records into per-model, per-task,
+per-architecture, and per-layer-depth tables for reporting.
+
+The input directory is explicit (WS0.2): v1 and v2 records must never
+blend invisibly into one table. When pointed at v2 records, the LEGACY
+clipped reliability (R_legacy) is used for every row — uniform v1
+semantics, announced loudly — because this script's aggregations predate
+the floored metrics. Floored (nullable-R) analysis ships with the v2
+stats tooling (WS6).
 """
 from __future__ import annotations
 
+import argparse
 import json
 import statistics
+import sys
 from collections import defaultdict
 from pathlib import Path
 
 from scipy.stats import spearmanr
 
-BENCH = Path(__file__).resolve().parent.parent / "results" / "benchmark"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-def load_records():
+def load_records(bench_dir: Path):
     recs = []
-    for f in sorted(BENCH.glob("*.jsonl")):
+    for f in sorted(bench_dir.glob("*.jsonl")):
         with open(f, encoding="utf-8") as fh:
             for line in fh:
-                recs.append(json.loads(line))
+                if line.strip():
+                    recs.append(json.loads(line))
+    if not recs:
+        sys.exit(f"no *.jsonl records found in {bench_dir}")
+
+    versions = {r.get("schema_version", 1) for r in recs}
+    if len(versions) > 1:
+        sys.exit(f"{bench_dir} mixes schema versions {sorted(versions)}; "
+                 f"keep record versions in separate directories.")
+    if versions == {2}:
+        print("=" * 70)
+        print("  NOTE: v2 records — using LEGACY clipped reliability "
+              "(R_legacy) for\n  every row so aggregations stay uniform and "
+              "v1-comparable. Floored\n  (nullable) R analysis belongs to "
+              "the v2 stats tooling (WS6).")
+        print("=" * 70)
+        for r in recs:
+            r["R"] = r["R_legacy"]
+            r["R_method"] = r["R_legacy_method"]
     return recs
 
 
@@ -53,7 +80,13 @@ def hit_rate(cells, keys):
 
 
 def main():
-    recs = load_records()
+    ap = argparse.ArgumentParser(description="Exploratory benchmark statistics")
+    ap.add_argument("--input-dir", default="results/benchmark",
+                    help="Directory of *.jsonl benchmark records")
+    args = ap.parse_args()
+    bench_dir = (Path(args.input_dir) if Path(args.input_dir).is_absolute()
+                 else PROJECT_ROOT / args.input_dir)
+    recs = load_records(bench_dir)
     cells = cell_medians(recs)
     print(f"total probe records: {len(recs)}")
     print(f"aggregated cells (model,layer,task,arch): {len(cells)}")

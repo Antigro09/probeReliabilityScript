@@ -56,6 +56,12 @@ class Task(ABC):
     chance_accuracy: float = 0.5
     zc_description: str = ""
     ze_description: str = ""
+    # Learnability-gate floors (src/gates.py): a linear probe at the gate
+    # layer must reach these held-out accuracies for the benchmark to
+    # launch. PROVISIONAL defaults — the registered values are an
+    # experimenter decision and must be locked in PREREGISTRATION_v2.md.
+    zc_gate_floor: float = 0.60
+    ze_gate_floor: float = 0.55
 
     @abstractmethod
     def load(self, paths: Iterable[Path], max_examples: int | None,
@@ -151,21 +157,30 @@ class SVATask(Task):
 # ---------------------------------------------------------------------------
 
 class GenderTask(Task):
-    """Gender agreement using Winogender-style templated sentences.
+    """Gender agreement on Winogender sentences (Rudinger et al. 2018).
 
-    Each example has a profession noun (gendered or neutral by US Census
-    statistics), a pronoun referring back, and we predict whether the
-    pronoun is feminine or masculine. Selectivity feature Ze is the
-    profession's gender association (skews toward female / male in
-    training data).
+    Zc = gender of the pronoun (1 FEM / 0 MASC). Ze = the occupation's
+    stereotypical gender skew (1 FEM_SKEW / 0 MASC_SKEW, from BLS
+    statistics). Sentences are full Winogender instantiations with the
+    pronoun INCLUDED in the input; they are produced by
+    scripts/generate_gender_data.py.
 
     Data format per file line: TAB-separated
-        sentence_prefix\tpronoun_label\tprofession_label
-    where pronoun_label in {"FEM", "MASC"} and profession_label in
-    {"FEM_SKEW", "MASC_SKEW", "NEUTRAL"}.
+        sentence\tpronoun_label\tprofession_label
+    with pronoun_label in {"FEM", "MASC"} and profession_label in
+    {"FEM_SKEW", "MASC_SKEW"}.
 
-    If the dataset isn't present, this task uses a built-in template
-    generator that produces ~2000 balanced examples deterministically.
+    v2 hardening (WS2) — this loader is deliberately strict:
+        - A missing data file is a hard error. The v1 silent fallback to a
+          synthetic template generator is deleted: it truncated sentences
+          BEFORE the pronoun, so every prefix carried both labels and the
+          task was unlearnable by construction — and because the fallback
+          was silent, that shipped. Twice.
+        - NEUTRAL profession labels are rejected. v1 mapped NEUTRAL->ze=1,
+          polluting the selectivity feature.
+        - Any sentence appearing with both Zc labels is a hard error
+          (the exact v1 failure signature).
+        - Every sentence must contain a pronoun consistent with its label.
     """
 
     name = "gender"
@@ -175,12 +190,16 @@ class GenderTask(Task):
 
     def load(self, paths, max_examples, seed):
         paths = [Path(p) for p in paths]
-        examples: list[Example] = []
-        if any(p.exists() for p in paths):
-            examples = self._load_from_files(paths)
-        if not examples:
-            # No gender-format data found on disk; fall back to synthetic templates.
-            examples = self._generate_synthetic(seed)
+        existing = [p for p in paths if p.exists()]
+        if not existing:
+            raise FileNotFoundError(
+                f"Gender task data not found at {[str(p) for p in paths]}. "
+                f"Generate it with: python -m scripts.generate_gender_data "
+                f"(see that script's docstring for source-data options). "
+                f"There is deliberately no synthetic fallback."
+            )
+        examples = self._load_from_files(existing)
+        self._validate(examples)
         rng = random.Random(seed)
         rng.shuffle(examples)
         if max_examples is not None:
@@ -190,67 +209,73 @@ class GenderTask(Task):
     def _load_from_files(self, paths):
         examples: list[Example] = []
         for path in paths:
-            if not path.exists():
-                continue
             with path.open("r", encoding="utf-8") as f:
-                for line in f:
+                for lineno, line in enumerate(f, start=1):
+                    if not line.strip():
+                        continue
                     parts = line.rstrip("\n").split("\t")
                     if len(parts) != 3:
-                        continue
+                        raise ValueError(
+                            f"{path}:{lineno}: expected 3 tab-separated "
+                            f"fields, got {len(parts)}: {line!r}"
+                        )
                     sent, pron_lab, prof_lab = parts
                     if pron_lab not in {"FEM", "MASC"}:
-                        continue
-                    if prof_lab not in {"FEM_SKEW", "MASC_SKEW", "NEUTRAL"}:
-                        continue
+                        raise ValueError(
+                            f"{path}:{lineno}: unknown pronoun label "
+                            f"{pron_lab!r} (expected FEM or MASC)"
+                        )
+                    if prof_lab == "NEUTRAL":
+                        raise ValueError(
+                            f"{path}:{lineno}: NEUTRAL occupations are not "
+                            f"part of the v2 gender task (v1 mapped them to "
+                            f"ze=1 and polluted the selectivity feature). "
+                            f"Regenerate the data with "
+                            f"scripts/generate_gender_data.py, which drops "
+                            f"them."
+                        )
+                    if prof_lab not in {"FEM_SKEW", "MASC_SKEW"}:
+                        raise ValueError(
+                            f"{path}:{lineno}: unknown profession label "
+                            f"{prof_lab!r} (expected FEM_SKEW or MASC_SKEW)"
+                        )
                     zc = 1 if pron_lab == "FEM" else 0
-                    # Ze: 1 = female-skewing or neutral, 0 = male-skewing
-                    ze = 1 if prof_lab != "MASC_SKEW" else 0
+                    ze = 1 if prof_lab == "FEM_SKEW" else 0
                     examples.append(Example(sentence=sent, zc=zc, ze=ze))
         return examples
 
-    def _generate_synthetic(self, seed: int) -> list[Example]:
-        """Generate templated gender-agreement examples deterministically.
-        This guarantees the experiment can run without external data and the
-        result is reproducible."""
-        rng = random.Random(seed)
+    @staticmethod
+    def _validate(examples: list[Example]) -> None:
+        """Refuse datasets showing the v1 failure signatures."""
+        if not examples:
+            raise ValueError("gender data file(s) contained no examples")
 
-        # US Census-style profession lists (illustrative only; for the paper
-        # we'll cite the source if we use the actual Winogender data).
-        fem_skew = ["nurse", "secretary", "teacher", "librarian", "stylist",
-                    "receptionist", "nanny", "hairdresser", "dietitian",
-                    "paralegal"]
-        masc_skew = ["plumber", "mechanic", "carpenter", "electrician",
-                     "firefighter", "construction worker", "truck driver",
-                     "engineer", "pilot", "soldier"]
-        neutral = ["doctor", "scientist", "writer", "artist", "lawyer",
-                   "manager", "consultant", "student", "researcher", "analyst"]
+        zc_by_sentence: dict[str, set[int]] = {}
+        for ex in examples:
+            zc_by_sentence.setdefault(ex.sentence, set()).add(ex.zc)
+        conflicting = [s for s, labels in zc_by_sentence.items()
+                       if len(labels) > 1]
+        if conflicting:
+            raise ValueError(
+                f"{len(conflicting)}/{len(zc_by_sentence)} unique sentences "
+                f"carry BOTH gender labels — the label is not a function of "
+                f"the input. This is the v1 truncated-before-the-pronoun "
+                f"dataset bug; regenerate the data with "
+                f"scripts/generate_gender_data.py. First offender: "
+                f"{conflicting[0]!r}"
+            )
 
-        templates = [
-            "The {prof} finished the project before",
-            "After the meeting, the {prof} explained that",
-            "Everyone said the {prof} was tired because",
-            "The {prof} returned to the office and",
-            "When the alarm went off, the {prof} realized that",
-            "Despite the late hour, the {prof} kept working because",
-            "The {prof} answered the phone and said that",
-            "On the way home, the {prof} thought about how",
-        ]
-
-        pronouns = [("she", "FEM", 1), ("he", "MASC", 0)]
-
-        examples: list[Example] = []
-        prof_lists = [(fem_skew, "FEM_SKEW", 1),
-                      (masc_skew, "MASC_SKEW", 0),
-                      (neutral, "NEUTRAL", 1)]
-        for prof_list, _prof_label, ze in prof_lists:
-            for prof in prof_list:
-                for tpl in templates:
-                    for pronoun, _pron_label, zc in pronouns:
-                        # Build the prefix: the sentence ends right before the pronoun.
-                        prefix = tpl.format(prof=prof)
-                        examples.append(Example(sentence=prefix, zc=zc, ze=ze))
-        rng.shuffle(examples)
-        return examples
+        fem_tokens = {"she", "her", "hers"}
+        masc_tokens = {"he", "his", "him"}
+        for ex in examples:
+            toks = {t.strip(".,;:!?\"'").lower() for t in ex.sentence.split()}
+            expected = fem_tokens if ex.zc == 1 else masc_tokens
+            if not toks & expected:
+                raise ValueError(
+                    f"sentence lacks a pronoun consistent with its label "
+                    f"(zc={ex.zc}): {ex.sentence!r}. The pronoun must be "
+                    f"part of the input; see scripts/generate_gender_data.py."
+                )
 
 
 # ---------------------------------------------------------------------------

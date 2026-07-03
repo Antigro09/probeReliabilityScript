@@ -93,6 +93,10 @@ def make_main_table(rows: list[dict]) -> list[dict]:
         return []
     best_per_model: dict[str, dict] = {}
     for r in rows:
+        if r["R"] is None:
+            # Below the decodability floor (schema v2): undefined R can
+            # never be the max. It stays visible in summary.csv.
+            continue
         key = r["model"]
         if key not in best_per_model or r["R"] > best_per_model[key]["R"]:
             best_per_model[key] = dict(r)  # copy

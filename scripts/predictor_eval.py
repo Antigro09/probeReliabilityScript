@@ -12,14 +12,24 @@ pre-registered predictions against the data:
 
     P3 (robustness): P1 (rho >= 0.4) and P2 (>= 40%) hold within EACH task.
 
-Output: results/benchmark/PREREG_OUTCOME.json plus a console summary.
+Output: <input-dir>/PREREG_OUTCOME.json plus a console summary.
 
-This script is locked at the pre-registration time. Do not modify it after
-the benchmark has been run -- doing so violates the pre-registration.
+This script is locked at the pre-registration time. Its thresholds and
+statistics must not change after the benchmark has been run -- doing so
+violates the pre-registration.
+
+WS0.2 amendment (I/O only, no change to thresholds or statistics): the
+input directory is now an explicit argument instead of a glob over
+results/benchmark/, and rows written by the v2 runner (schema_version >= 2)
+are refused. Both guards exist so v1 and v2 records can never blend
+invisibly into one analysis. The v2 evaluator with its own locked
+thresholds is PREREGISTRATION_v2 territory (prereg_v2_eval.py, WS6) — this
+script evaluates the v1 pre-registration only.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from collections import defaultdict
@@ -40,18 +50,28 @@ P3_TASK_RHO_THRESHOLD = 0.4
 P3_TASK_HITRATE_THRESHOLD = 0.40
 
 
-def load_benchmark_rows() -> list[dict]:
-    """Load every line of every results/benchmark/*.jsonl file."""
-    bench_dir = PROJECT_ROOT / "results" / "benchmark"
+def load_benchmark_rows(bench_dir: Path) -> list[dict]:
+    """Load every line of every *.jsonl file in the given directory."""
     if not bench_dir.exists():
         return []
     rows: list[dict] = []
     for f in sorted(bench_dir.glob("*.jsonl")):
         with f.open() as fh:
-            for line in fh:
+            for lineno, line in enumerate(fh, start=1):
                 line = line.strip()
-                if line:
-                    rows.append(json.loads(line))
+                if not line:
+                    continue
+                row = json.loads(line)
+                if row.get("schema_version", 1) >= 2:
+                    sys.exit(
+                        f"{f}:{lineno}: row has schema_version="
+                        f"{row['schema_version']}. This evaluator is locked "
+                        f"to the v1 pre-registration and must not consume "
+                        f"v2 records; use the v2 evaluator "
+                        f"(prereg_v2_eval.py) once PREREGISTRATION_v2.md "
+                        f"is locked."
+                    )
+                rows.append(row)
     return rows
 
 
@@ -193,12 +213,20 @@ def classify_outcome(p1: dict, p2: dict, p3: dict) -> str:
 
 
 def main():
-    rows = load_benchmark_rows()
+    ap = argparse.ArgumentParser(description="Evaluate the v1 pre-registered "
+                                             "predictions on benchmark records")
+    ap.add_argument("--input-dir", default="results/benchmark",
+                    help="Directory of *.jsonl benchmark records (v1 schema)")
+    args = ap.parse_args()
+    bench_dir = (Path(args.input_dir) if Path(args.input_dir).is_absolute()
+                 else PROJECT_ROOT / args.input_dir)
+
+    rows = load_benchmark_rows(bench_dir)
     if not rows:
-        print("❌ No benchmark results found in results/benchmark/")
+        print(f"❌ No benchmark results found in {bench_dir}")
         print("   Run scripts/run_benchmark.py first.")
         sys.exit(1)
-    print(f"Loaded {len(rows)} probe records")
+    print(f"Loaded {len(rows)} probe records from {bench_dir}")
 
     cell_aggs = aggregate_by_cell(rows)
     print(f"Aggregated into {len(cell_aggs)} cells "
@@ -264,7 +292,7 @@ def main():
         "n_cells": len(cell_aggs),
     }
     out = _native(out)
-    out_path = PROJECT_ROOT / "results" / "benchmark" / "PREREG_OUTCOME.json"
+    out_path = bench_dir / "PREREG_OUTCOME.json"
     out_path.write_text(json.dumps(out, indent=2))
     print(f"\nSaved: {out_path}")
 

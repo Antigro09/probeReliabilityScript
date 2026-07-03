@@ -258,27 +258,35 @@ def _validate_extraction_position(
 
 
 @torch.no_grad()
-def extract_layer_reps(
+def extract_layers_multi(
     bundle: ModelBundle,
     examples: list,
-    layer_idx: int,
+    layer_idxs: Iterable[int],
     batch_size: int = 32,
     max_length: int = 256,
     show_progress: bool = True,
     validate: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
-    Extract last-token residual stream representations at a single layer.
+    Extract last-token representations at SEVERAL layers with a SINGLE
+    forward pass per batch (WS0.4).
 
-    Returns:
-        X: (N, H) float32 CPU tensor of representations
-        zc: (N,) long CPU tensor of target labels
-        ze: (N,) long CPU tensor of attractor labels
+    The v1 benchmark called extract_layer_reps once per layer, re-running
+    the full forward pass each time — a 5x waste for 5 probed layers, and
+    extraction dominates the benchmark's wall-clock (probe training was
+    only ~6.5 h across all 5,400 v1 records). output_hidden_states already
+    materializes every layer per forward; we simply keep all requested ones.
+
+    Returns dict: layer_idx -> (X, zc, ze), each on CPU / float32.
     """
-    if not (0 <= layer_idx <= bundle.n_layers):
-        raise ValueError(
-            f"layer_idx={layer_idx} out of range [0, {bundle.n_layers}]"
-        )
+    layer_idxs = sorted(set(int(l) for l in layer_idxs))
+    for layer_idx in layer_idxs:
+        if not (0 <= layer_idx <= bundle.n_layers):
+            raise ValueError(
+                f"layer_idx={layer_idx} out of range [0, {bundle.n_layers}]"
+            )
+    if not layer_idxs:
+        return {}
 
     if validate:
         # Cheap once-per-call sanity check that catches tokenizer surprises
@@ -290,27 +298,55 @@ def extract_layer_reps(
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
                         collate_fn=collate)
 
-    X_chunks: list[torch.Tensor] = []
+    X_chunks: dict[int, list[torch.Tensor]] = {l: [] for l in layer_idxs}
     zc_chunks: list[torch.Tensor] = []
     ze_chunks: list[torch.Tensor] = []
 
-    iterator = tqdm(loader, desc=f"extract L{layer_idx}",
-                    disable=not show_progress)
+    desc = f"extract L{','.join(str(l) for l in layer_idxs)}"
+    iterator = tqdm(loader, desc=desc, disable=not show_progress)
     for toks, zc, ze in iterator:
         toks = {k: v.to(bundle.device) for k, v in toks.items()}
         out = bundle.model(**toks)
         # hidden_states is a tuple of length n_layers + 1 (embeddings + each block)
-        h = out.hidden_states[layer_idx]   # (B, T, H), bf16
-        rep = _last_token_hidden(h, toks["attention_mask"])  # (B, H)
-        X_chunks.append(rep.float().cpu())
+        for layer_idx in layer_idxs:
+            h = out.hidden_states[layer_idx]   # (B, T, H), bf16
+            rep = _last_token_hidden(h, toks["attention_mask"])  # (B, H)
+            X_chunks[layer_idx].append(rep.float().cpu())
         zc_chunks.append(zc)
         ze_chunks.append(ze)
 
-    return (
-        torch.cat(X_chunks, dim=0),
-        torch.cat(zc_chunks, dim=0),
-        torch.cat(ze_chunks, dim=0),
-    )
+    zc_all = torch.cat(zc_chunks, dim=0)
+    ze_all = torch.cat(ze_chunks, dim=0)
+    return {
+        layer_idx: (torch.cat(X_chunks[layer_idx], dim=0), zc_all, ze_all)
+        for layer_idx in layer_idxs
+    }
+
+
+def extract_layer_reps(
+    bundle: ModelBundle,
+    examples: list,
+    layer_idx: int,
+    batch_size: int = 32,
+    max_length: int = 256,
+    show_progress: bool = True,
+    validate: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Extract last-token residual stream representations at a single layer.
+    Thin wrapper over extract_layers_multi; prefer the multi-layer call
+    when more than one layer is needed.
+
+    Returns:
+        X: (N, H) float32 CPU tensor of representations
+        zc: (N,) long CPU tensor of target labels
+        ze: (N,) long CPU tensor of attractor labels
+    """
+    return extract_layers_multi(
+        bundle, examples, [layer_idx],
+        batch_size=batch_size, max_length=max_length,
+        show_progress=show_progress, validate=validate,
+    )[layer_idx]
 
 
 def extract_all_layers(
@@ -320,63 +356,77 @@ def extract_all_layers(
     batch_size: int = 32,
     max_length: int = 256,
     cache_dir: Path | None = None,
+    cache_tag: str = "",
 ) -> dict[int, dict]:
     """
-    Extract representations for the given layers.
+    Extract representations for the given layers, sharing ONE forward pass
+    per batch across all cache-miss layers.
 
     Returns a dict mapping layer_idx -> {"X": ..., "zc": ..., "ze": ...}.
     If cache_dir is given, saves each layer's tensors plus a JSON
     provenance sidecar that records exactly how the cache was produced
     (model name, layer, dtype, dataset hash). Subsequent calls reuse the
     cache only if the provenance matches.
+
+    cache_tag distinguishes different example sets of the same size (e.g.
+    the probe-train / intervention / test splits of the benchmark); the
+    dataset hash is also part of the filename, so caches can never collide
+    across splits or data versions.
     """
     from .repro import hash_examples, write_provenance, read_provenance
 
     out: dict[int, dict] = {}
-    layers = list(layers)
+    layers = sorted(set(int(l) for l in layers))
 
     # Validate position once for this model, not per layer
     sample = [ex.sentence for ex in examples[:8]]
     _validate_extraction_position(bundle, sample, max_length=max_length)
 
     data_hash = hash_examples(examples)
+    safe_name = bundle.name.replace("/", "_")
+    tag = f"{cache_tag}_" if cache_tag else ""
 
+    def _paths(layer_idx: int) -> tuple[Path, Path] | tuple[None, None]:
+        if cache_dir is None:
+            return None, None
+        cdir = Path(cache_dir)
+        cdir.mkdir(parents=True, exist_ok=True)
+        cache_path = cdir / f"{safe_name}_{tag}L{layer_idx}_{data_hash}.pt"
+        return cache_path, cache_path.with_suffix(".json")
+
+    missing: list[int] = []
     for layer_idx in layers:
-        cache_path = None
-        prov_path = None
-        if cache_dir is not None:
-            cache_dir = Path(cache_dir)
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            safe_name = bundle.name.replace("/", "_")
-            cache_path = cache_dir / f"{safe_name}_L{layer_idx}_n{len(examples)}.pt"
-            prov_path = cache_path.with_suffix(".json")
+        cache_path, prov_path = _paths(layer_idx)
+        if cache_path is not None and cache_path.exists() and prov_path.exists():
+            prov = read_provenance(prov_path)
+            if prov and prov.get("data_hash") == data_hash:
+                out[layer_idx] = torch.load(cache_path, weights_only=True)
+                continue
+            # else: stale cache, fall through and re-extract
+        missing.append(layer_idx)
 
-            if cache_path.exists() and prov_path.exists():
-                prov = read_provenance(prov_path)
-                if prov and prov.get("data_hash") == data_hash:
-                    out[layer_idx] = torch.load(cache_path, weights_only=True)
-                    continue
-                # else: stale cache, fall through and re-extract
-
-        X, zc, ze = extract_layer_reps(
-            bundle, examples, layer_idx,
+    if missing:
+        extracted = extract_layers_multi(
+            bundle, examples, missing,
             batch_size=batch_size, max_length=max_length,
             validate=False,  # already validated above
         )
-        out[layer_idx] = {"X": X, "zc": zc, "ze": ze}
-
-        if cache_path is not None:
-            torch.save(out[layer_idx], cache_path)
-            write_provenance(prov_path, {
-                "model": bundle.name,
-                "layer": layer_idx,
-                "n_examples": len(examples),
-                "hidden_size": bundle.hidden_size,
-                "n_layers": bundle.n_layers,
-                "dtype": str(bundle.dtype),
-                "extraction_rule": "last non-padding input token",
-                "add_special_tokens": False,
-                "data_hash": data_hash,
-                "max_length": max_length,
-            })
+        for layer_idx, (X, zc, ze) in extracted.items():
+            out[layer_idx] = {"X": X, "zc": zc, "ze": ze}
+            cache_path, prov_path = _paths(layer_idx)
+            if cache_path is not None:
+                torch.save(out[layer_idx], cache_path)
+                write_provenance(prov_path, {
+                    "model": bundle.name,
+                    "layer": layer_idx,
+                    "n_examples": len(examples),
+                    "hidden_size": bundle.hidden_size,
+                    "n_layers": bundle.n_layers,
+                    "dtype": str(bundle.dtype),
+                    "extraction_rule": "last non-padding input token",
+                    "add_special_tokens": False,
+                    "data_hash": data_hash,
+                    "max_length": max_length,
+                    "cache_tag": cache_tag,
+                })
     return out

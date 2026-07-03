@@ -143,8 +143,11 @@ def main():
         val_probes, X_pre=X_in, X_post=X_post, zc=zc_in, ze=ze_in,
         device=device,
     )
-    print(f"      FGSM:  C={metrics.completeness:.3f}  "
-          f"S={metrics.selectivity:.3f}  R={metrics.reliability:.3f}")
+    def _fmt(v):
+        return "null" if v is None else f"{v:.3f}"
+    print(f"      FGSM:  C={_fmt(metrics.completeness)}  "
+          f"S={_fmt(metrics.selectivity)}  R={_fmt(metrics.reliability)} "
+          f"(C/S/R are null below the decodability floor; see src/metrics.py)")
 
     # 9. Hessian
     print("\n[9/9] Hessian spectrum (top-5) for Linear probe...")

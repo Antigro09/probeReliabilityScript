@@ -34,9 +34,13 @@ Accept licenses on:
 ### Data
 
 - SVA: place numpred.{train,val,test} in data/.
-- Gender agreement: optional data/gender.tsv (TAB-separated:
-  sentence  FEM|MASC  FEM_SKEW|MASC_SKEW|NEUTRAL).
-  If absent, the task generates ~480 synthetic examples deterministically.
+- Gender agreement: data/gender.tsv (TAB-separated:
+  sentence  FEM|MASC  FEM_SKEW|MASC_SKEW), REQUIRED — generate it with
+  `python -m scripts.generate_gender_data` (see that script's docstring
+  for Winogender source options). The v1 synthetic fallback is deleted:
+  it silently produced sentences truncated before the pronoun, making the
+  task unlearnable, and the file currently in data/ is that broken v1
+  artifact (kept only for the v1 record; the v2 loader rejects it).
 - SST-2: optional data/sst2.tsv (TAB: sentence  0|1). If absent,
   loads from HuggingFace stanfordnlp/sst2.
 
@@ -92,8 +96,18 @@ foreach ($cfg in @("pythia","bert","gpt2","qwen","llama","gemma")) {
 }
 ```
 
-Each run writes results/benchmark/<model>_<task>.jsonl, one JSON record
-per probe (5,400 records total at full scale).
+Each run writes results/benchmark_v2/<model>_<task>.jsonl (schema v2),
+one JSON record per probe (5,400 records total at full scale), plus a
+.manifest.json with config, git commit, data hashes, and the
+learnability-gate record for each (re)launch. Runs are resume-safe:
+completed (layer, arch, seed) cells found in the output file are skipped.
+Before launching, a learnability gate (src/gates.py) checks that Zc and
+Ze are linearly decodable at the middle probed layer and that a
+shuffled-label control sits at chance; the run refuses to start otherwise.
+The tainted v1 records remain untouched in results/benchmark/ and are
+analyzed only by the locked v1 evaluator (scripts/predictor_eval.py);
+analysis scripts take an explicit --input-dir and refuse to mix schema
+versions.
 
 ## Methodology Highlights
 

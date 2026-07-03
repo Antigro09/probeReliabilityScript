@@ -12,6 +12,14 @@ during training, which pushes the probe-induced representation to preserve
 the input's local neighborhood structure. The regularization weight is
 controlled by mka_lambda; setting it to 0 makes MKAProbe behave identically
 to MLPProbe (useful as an ablation).
+
+v2 note: the regularizer's hidden-side kernel is a soft RBF kernel
+(rbf_kernel), not a binary kNN adjacency. The binary kernel used in v1 was
+built under torch.no_grad() from scatter_ of constants, so it was
+piecewise-constant with zero gradient almost everywhere — the regularizer
+added a constant to the loss and MKA collapsed to MLP (byte-identical
+parameters in 1800/1800 seed-matched v1 records). Acceptance tests for the
+fix live in tests/test_mka.py.
 """
 
 from __future__ import annotations
@@ -83,6 +91,62 @@ class MLPProbe(_ProbeBase):
 # MKA: Manifold Kernel Alignment
 # ---------------------------------------------------------------------------
 
+def pairwise_sq_dists(x: torch.Tensor) -> torch.Tensor:
+    """
+    (N, N) matrix of squared Euclidean distances, differentiable everywhere.
+
+    Computed as ||xi||^2 + ||xj||^2 - 2<xi, xj> rather than via torch.cdist,
+    whose backward is undefined at zero distance (the diagonal).
+    """
+    sq = (x * x).sum(dim=1, keepdim=True)          # (N, 1)
+    d2 = sq + sq.T - 2.0 * (x @ x.T)
+    return d2.clamp_min(0.0)
+
+
+def rbf_kernel(x: torch.Tensor, k: int | None = None,
+               bandwidth: float | torch.Tensor | None = None,
+               zero_diagonal: bool = True) -> torch.Tensor:
+    """
+    Soft (differentiable) neighborhood kernel: K[i, j] = exp(-d2_ij / b).
+
+    Bandwidth selection (in priority order):
+        - explicit `bandwidth` if given;
+        - if `k` is given: the median over points of the squared distance
+          to the k-th nearest neighbor. This ties the soft kernel's
+          resolution to the same k as the hard kNN kernel it is aligned
+          against: a typical k-th neighbor gets weight e^-1, closer
+          neighbors more, farther points decay smoothly. Without it, plain
+          median-of-all-pairs bandwidth goes nearly flat in high dimension
+          (distance concentration) and barely tracks neighborhood structure.
+        - otherwise: median of all off-diagonal squared distances.
+
+    The bandwidth is treated as a constant (detached), so gradients flow
+    only through the distances — that is the gradient path the MKA
+    regularizer needs.
+
+    The diagonal is zeroed by default for consistency with knn_kernel,
+    which also has a zero diagonal (self is excluded from the neighbor set).
+    """
+    d2 = pairwise_sq_dists(x)
+    n = x.shape[0]
+    if bandwidth is None:
+        with torch.no_grad():
+            if n < 2:
+                bandwidth = torch.tensor(1.0, device=x.device)
+            elif k is not None:
+                k_actual = max(1, min(k, n - 1))
+                d2_noself = d2 + torch.eye(n, device=x.device) * torch.finfo(d2.dtype).max / 2
+                kth, _ = torch.topk(d2_noself, k=k_actual, dim=1, largest=False)
+                bandwidth = kth[:, -1].median().clamp_min(1e-12)
+            else:
+                off_diag = d2[~torch.eye(n, dtype=torch.bool, device=x.device)]
+                bandwidth = off_diag.median().clamp_min(1e-12)
+    K = torch.exp(-d2 / bandwidth)
+    if zero_diagonal:
+        K = K * (1.0 - torch.eye(n, device=x.device, dtype=K.dtype))
+    return K
+
+
 def knn_kernel(x: torch.Tensor, k: int = 10) -> torch.Tensor:
     """
     Binary k-nearest-neighbor adjacency matrix for x of shape (N, D).
@@ -107,22 +171,31 @@ def knn_kernel(x: torch.Tensor, k: int = 10) -> torch.Tensor:
 
 def mka_score(K: torch.Tensor, L: torch.Tensor) -> torch.Tensor:
     """
-    Manifold-approximated Kernel Alignment between two (N, N) kernels.
+    Manifold-approximated Kernel Alignment between two (N, N) kernels:
+    the cosine similarity of the mean-centered kernels,
 
-    Following Islam et al. 2025:
-        MKA(K, L) = (<K, L> - D^2) / sqrt((<K, K> - D^2)(<L, L> - D^2))
-    where D^2 = mean(K) * mean(L).
+        MKA(K, L) = <K - mean(K), L - mean(L)>
+                    / (||K - mean(K)|| * ||L - mean(L)||)
 
-    Returns a scalar in roughly [-1, 1]. Higher means more aligned.
+    Bounded in [-1, 1] by Cauchy-Schwarz. Higher means more aligned.
+
+    v2 fix: the v1 implementation subtracted the CROSS term
+    mean(K)*mean(L)*N^2 inside BOTH denominator variance terms. That is
+    algebraically equal to this form when mean(K) == mean(L) — always true
+    in v1, where both kernels were binary kNN adjacencies with identical
+    row sums — but for kernels with different means a denominator term can
+    go negative, hit the clamp, and blow the score up by ~1e6. Each
+    variance term now uses its own kernel's mean, which is the standard
+    centered-alignment definition and is non-negative by construction.
     """
-    D2 = K.mean() * L.mean() * (K.numel())
-    # Equivalent: D2 = (K.sum()/N**2) * (L.sum()/N**2) * N**2 = K.sum()*L.sum()/N**2
-    # We compute it as in the original notebook for parity:
     n = K.numel()
-    D2 = (K.sum() / n) * (L.sum() / n) * n
-    num = (K * L).sum() - D2
-    denom_sq = ((K * K).sum() - D2) * ((L * L).sum() - D2)
-    den = torch.sqrt(torch.clamp(denom_sq, min=1e-12))
+    K_mean = K.mean()
+    L_mean = L.mean()
+    num = (K * L).sum() - n * K_mean * L_mean
+    var_K = (K * K).sum() - n * K_mean * K_mean
+    var_L = (L * L).sum() - n * L_mean * L_mean
+    den = torch.sqrt(torch.clamp(var_K, min=1e-12) *
+                     torch.clamp(var_L, min=1e-12))
     return num / den
 
 
@@ -135,8 +208,17 @@ class MKAProbe(_ProbeBase):
     local neighborhood structure of the input representation.
 
     The regularizer is applied per-batch, computed via:
-        L_mka = -mka_score(knn_kernel(input), knn_kernel(hidden))
+        L_mka = -mka_score(knn_kernel(input), rbf_kernel(hidden))
     Negating because we want to MAXIMIZE alignment.
+
+    Kernel choice (v2 fix): the HIDDEN kernel must be differentiable
+    w.r.t. the activations, otherwise the regularizer contributes zero
+    gradient and MKA training is byte-identical to plain MLP training —
+    which is exactly what happened in v1, where both kernels were binary
+    kNN adjacencies built under torch.no_grad(). The hidden side now uses
+    a soft RBF kernel with median-heuristic bandwidth. The INPUT kernel
+    stays hard binary kNN: there is no gradient path through the input
+    anyway, and a hard neighbor set is a cleaner alignment target.
     """
 
     def __init__(self, input_dim: int, hidden_dim: int = 256,
@@ -157,9 +239,9 @@ class MKAProbe(_ProbeBase):
 
     def mka_loss(self, x_input: torch.Tensor,
                  hidden: torch.Tensor) -> torch.Tensor:
-        """Compute -MKA(input_kNN, hidden_kNN)."""
+        """Compute -MKA(input_kNN, hidden_RBF). Differentiable in `hidden`."""
         K_in = knn_kernel(x_input, k=self.knn_k)
-        K_h = knn_kernel(hidden, k=self.knn_k)
+        K_h = rbf_kernel(hidden, k=self.knn_k)
         return -mka_score(K_in, K_h)
 
 
