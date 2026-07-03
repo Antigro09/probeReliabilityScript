@@ -30,3 +30,6 @@ seaborn>=0.13.0
 
 # Reproducibility
 einops>=0.8.0
+
+# Tests (tests/)
+pytest>=8.0.0

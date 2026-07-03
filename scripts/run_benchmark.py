@@ -1,14 +1,14 @@
 """
-K-seed benchmark runner for the alignment-as-predictor experiment.
+K-seed benchmark runner for the alignment-as-predictor experiment (v2).
 
 For each (model, layer, task, architecture) combination, train K probes
 with different random seeds. For each probe, record:
     - test accuracy
     - mean directional alignment with top-20 Hessian eigenvectors (the predictor A)
-    - max reliability across the five intervention methods (the target R)
-
-This produces the dataset used by predictor_eval.py to compute Spearman
-correlation and rank-1 hit rate against the pre-registered thresholds.
+    - reliability across the five intervention methods (the target R),
+      with the FULL per-method metric record (raw pre/post validation
+      accuracies, unclipped ratios, room denominators, floored + legacy
+      clipped values — see src/metrics.py)
 
 Usage:
     # Run the full benchmark (slow, days of compute):
@@ -18,8 +18,27 @@ Usage:
     python -m scripts.run_benchmark --config configs/tiny.yaml --task sva --k 2
 
 Output:
-    results/benchmark/<model>_<task>.jsonl
-    one line per probe = one (model, layer, task, architecture, seed) cell.
+    <out-dir>/<model>_<task>.jsonl        (default out-dir: results/benchmark_v2)
+    one line per probe = one (model, layer, task, architecture, seed) cell,
+    stamped with schema_version and the git commit of the code that wrote it.
+    <out-dir>/<model>_<task>.manifest.json  records config, data hashes,
+    learnability-gate results, and one entry per (re)launch.
+
+v2 hardening (WS0):
+    - RESUME-SAFE: on startup the existing output file is read and completed
+      (layer, arch, seed) cells are skipped. v1 opened the file in append
+      mode with no check, so an interrupted-and-restarted run silently
+      duplicated rows and poisoned every median.
+    - VERSIONED OUTPUT: v2 rows land in their own directory and carry
+      schema_version + git commit; analysis scripts take an explicit input
+      dir instead of globbing everything (v1 blended any *.jsonl it found).
+    - LEARNABILITY GATE (WS2): before launching, a linear probe at the
+      middle probed layer must beat the task's registered floor and a
+      shuffled-label control must sit at chance, for both Zc and Ze.
+      Otherwise the run refuses to start (exit code 2).
+    - SINGLE-PASS EXTRACTION + CACHE: all probed layers are captured from
+      one forward pass per batch and cached to disk with provenance
+      (v1 ran a full forward per layer and cached nothing here).
 
 The JSONL format keeps individual seeds visible so the predictor evaluator
 can compute median-over-seeds aggregations honestly.
@@ -28,7 +47,9 @@ can compute median-over-seeds aggregations honestly.
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -40,17 +61,23 @@ import torch
 
 from src.pipeline import load_config
 from src.extraction import (
-    load_model, select_layers, extract_layer_reps, pick_device,
+    load_model, select_layers, extract_all_layers, pick_device,
 )
 from src.probes import (
     LinearProbe, MLPProbe, MKAProbe,
     ProbeTrainConfig, train_probe, probe_accuracy,
 )
-from src.metrics import train_validation_probes, compute_intervention_metrics
+from src.metrics import (
+    train_validation_probes, compute_intervention_metrics, DECODABILITY_FLOOR,
+)
+from src.gates import learnability_gate
 from src.interventions import InterventionConfig, run_all_interventions
 from src.hessian import compute_hessian_spectrum
-from src.repro import set_seed
+from src.repro import set_seed, hash_examples
 from src.tasks import get_task
+
+SCHEMA_VERSION = 2
+ARCHS = ("linear", "mlp", "mka")
 
 
 def parse_args():
@@ -69,20 +96,74 @@ def parse_args():
     p.add_argument("--data-paths", default=None,
                    help="Comma-separated paths for the task data; "
                         "defaults to config['data']['paths']")
+    p.add_argument("--out-dir", default="results/benchmark_v2",
+                   help="Output directory (versioned; keep v2 rows away "
+                        "from the tainted v1 records)")
+    p.add_argument("--cache-dir", default="cache/benchmark_v2",
+                   help="Representation cache directory ('' disables caching)")
+    p.add_argument("--floor", type=float, default=DECODABILITY_FLOOR,
+                   help="Decodability floor for C/S denominators "
+                        "(see src/metrics.py; lock in PREREGISTRATION_v2.md)")
     return p.parse_args()
+
+
+def git_commit_hash() -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT,
+            capture_output=True, text=True, check=True, timeout=10,
+        ).stdout.strip()
+    except Exception:
+        return "unknown"
 
 
 def default_data_paths(task_name: str, cfg: dict) -> list[Path]:
     """Return task-specific default data paths.
 
-    Model configs point at the original SVA files. Other tasks have their own
-    conventional filenames and handle missing data internally.
+    Model configs point at the original SVA files. Other tasks have their
+    own conventional filenames; missing files are a hard error inside the
+    task loaders (there are deliberately no silent fallbacks).
     """
     if task_name == "gender":
         return [PROJECT_ROOT / "data" / "gender.tsv"]
     if task_name == "sst2":
         return [PROJECT_ROOT / "data" / "sst2.tsv"]
     return [PROJECT_ROOT / p for p in cfg["data"]["paths"]]
+
+
+def load_completed_cells(out_path: Path) -> set[tuple[int, str, int]]:
+    """Read an existing output file and return completed (layer, arch, seed).
+
+    Refuses to resume onto a file containing rows from a different schema
+    version — mixed-schema files are how tainted and clean data blend
+    invisibly.
+    """
+    done: set[tuple[int, str, int]] = set()
+    if not out_path.exists():
+        return done
+    with out_path.open() as f:
+        for lineno, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            row_schema = row.get("schema_version", 1)
+            if row_schema != SCHEMA_VERSION:
+                raise SystemExit(
+                    f"{out_path}:{lineno}: row has schema_version="
+                    f"{row_schema}, this runner writes {SCHEMA_VERSION}. "
+                    f"Refusing to mix schema versions in one file — move the "
+                    f"old file out of the way or pass a different --out-dir."
+                )
+            key = (row["layer"], row["arch"], row["seed"])
+            if key in done:
+                raise SystemExit(
+                    f"{out_path}:{lineno}: duplicate cell {key} already in "
+                    f"the output file. This file predates the resume fix or "
+                    f"was concatenated; de-duplicate before resuming."
+                )
+            done.add(key)
+    return done
 
 
 def make_probe(arch: str, dim: int, hidden_dim: int,
@@ -117,6 +198,7 @@ def run_one_cell(
     interventions_dict,  # pre-computed once per layer (don't recompute per probe)
     cfg: dict,
     device: torch.device,
+    floor: float,
 ) -> dict:
     """Train one probe at one (arch, seed), compute A and R."""
     # Per-seed determinism. Shuffles in train_probe will pick up this seed.
@@ -149,23 +231,28 @@ def run_one_cell(
     A = spec.mean_align_top  # mean |cos| with top-N eigenvectors
     lambda_max = spec.lambda_max
 
-    # ---- Target R: max reliability across the 5 interventions ----
-    # Important: re-train validation probes WOULD leak. We use the
+    # ---- Target R across the 5 interventions ----
+    # Important: re-training validation probes WOULD leak. We use the
     # pre-computed val_probes (trained on un-intervened reps per-layer).
-    best_R = -1.0
-    best_method = None
-    per_method = {}
+    # Schema v2 stores the FULL metric record per method (raw pre/post
+    # accuracies, unclipped ratios, rooms) so denominator pathologies are
+    # diagnosable from the record itself (see src/metrics.py).
+    per_method: dict[str, dict] = {}
+    best_R, best_method = None, None
+    best_R_legacy, best_method_legacy = -1.0, None
     for method, X_post in interventions_dict.items():
         m = compute_intervention_metrics(
             val_probes, X_pre=X_inter, X_post=X_post,
-            zc=zc_inter, ze=ze_inter, device=device,
+            zc=zc_inter, ze=ze_inter, device=device, floor=floor,
         )
-        per_method[method] = {
-            "C": m.completeness, "S": m.selectivity, "R": m.reliability,
-        }
-        if m.reliability > best_R:
+        per_method[method] = m.as_dict()
+        if m.reliability is not None and \
+                (best_R is None or m.reliability > best_R):
             best_R = m.reliability
             best_method = method
+        if m.reliability_clipped > best_R_legacy:
+            best_R_legacy = m.reliability_clipped
+            best_method_legacy = method
 
     return {
         "arch": arch,
@@ -173,9 +260,16 @@ def run_one_cell(
         "accuracy": acc,
         "A": A,
         "lambda_max": lambda_max,
+        # Floored (v2) target: None if EVERY method's R is null for this
+        # cell (e.g. Ze not decodable at this layer).
         "R": best_R,
         "R_method": best_method,
+        # Legacy v1 semantics (max over clipped R), for comparability only.
+        "R_legacy": best_R_legacy,
+        "R_legacy_method": best_method_legacy,
         "per_method": per_method,
+        "val_zc_acc": val_probes.acc_zc,
+        "val_ze_acc": val_probes.acc_ze,
         "num_params": probe.num_params(),
     }
 
@@ -190,8 +284,10 @@ def main():
         cfg["extraction"]["layers"] = [int(x) for x in args.layers.split(",")]
 
     task = get_task(args.task)
+    commit = git_commit_hash()
     print("=" * 70)
-    print(f"  Benchmark: {cfg['model']['name']}  task={task.name}  k={args.k}")
+    print(f"  Benchmark v{SCHEMA_VERSION}: {cfg['model']['name']}  "
+          f"task={task.name}  k={args.k}  commit={commit[:12]}")
     print("=" * 70)
 
     set_seed(cfg["output"]["seed"])
@@ -231,14 +327,113 @@ def main():
     )
     print(f"[layers] {layers}")
 
-    # Output
+    # Output (versioned, resume-safe)
     safe_name = cfg["model"]["name"].replace("/", "_")
-    out_dir = PROJECT_ROOT / "results" / "benchmark"
+    out_dir = Path(args.out_dir) if Path(args.out_dir).is_absolute() \
+        else PROJECT_ROOT / args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{safe_name}_{task.name}.jsonl"
+    manifest_path = out_dir / f"{safe_name}_{task.name}.manifest.json"
+    done = load_completed_cells(out_path)
+    total_cells = len(layers) * len(ARCHS) * args.k
     print(f"[output] {out_path}")
+    if done:
+        print(f"[resume] found {len(done)} completed cells "
+              f"({total_cells - len(done)} remaining)")
 
-    archs = ["linear", "mlp", "mka"]
+    cache_dir = None
+    if args.cache_dir:
+        cache_dir = (Path(args.cache_dir) if Path(args.cache_dir).is_absolute()
+                     else PROJECT_ROOT / args.cache_dir) / f"{safe_name}_{task.name}"
+
+    def layer_done(layer: int) -> bool:
+        return all((layer, a, 1000 + k) in done
+                   for a in ARCHS for k in range(args.k))
+
+    pending_layers = [l for l in layers if not layer_done(l)]
+    gate_layer = layers[len(layers) // 2]
+
+    # ---- Extraction: one forward pass per batch for all needed layers ----
+    # The gate layer's probe-split reps are always needed, even on resume.
+    probe_layers = sorted(set(pending_layers) | {gate_layer})
+    print(f"[extract] probe-train split, layers {probe_layers}")
+    reps_probe = extract_all_layers(
+        bundle, train_ex, probe_layers,
+        batch_size=cfg["extraction"]["batch_size"],
+        max_length=cfg["extraction"]["max_length"],
+        cache_dir=cache_dir, cache_tag="probe",
+    )
+    print(f"[extract] intervention split, layers {pending_layers}")
+    reps_inter = extract_all_layers(
+        bundle, inter_ex, pending_layers,
+        batch_size=cfg["extraction"]["batch_size"],
+        max_length=cfg["extraction"]["max_length"],
+        cache_dir=cache_dir, cache_tag="inter",
+    )
+    print(f"[extract] test split, layers {pending_layers}")
+    reps_test = extract_all_layers(
+        bundle, test_ex, pending_layers,
+        batch_size=cfg["extraction"]["batch_size"],
+        max_length=cfg["extraction"]["max_length"],
+        cache_dir=cache_dir, cache_tag="test",
+    )
+
+    train_cfg = ProbeTrainConfig(
+        epochs=cfg["probes"]["epochs"],
+        lr=cfg["probes"]["lr"],
+        weight_decay=cfg["probes"]["weight_decay"],
+        batch_size=cfg["probes"]["batch_size"],
+    )
+
+    # ---- Learnability gate (WS2): refuse to launch on an unlearnable task ----
+    g = reps_probe[gate_layer]
+    gate = learnability_gate(
+        g["X"], g["zc"], g["ze"], device, train_cfg,
+        zc_floor=task.zc_gate_floor, ze_floor=task.ze_gate_floor,
+        chance=task.chance_accuracy, layer=gate_layer,
+    )
+    print(f"[gate] {gate.report()}")
+
+    # ---- Manifest: provenance for this (re)launch ----
+    manifest = {"schema_version": SCHEMA_VERSION, "runs": []}
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except json.JSONDecodeError:
+            print(f"[warn] unreadable manifest {manifest_path}; rewriting")
+            manifest = {"schema_version": SCHEMA_VERSION, "runs": []}
+    manifest["runs"].append({
+        "timestamp_utc": datetime.datetime.now(datetime.timezone.utc)
+                         .isoformat(timespec="seconds"),
+        "git_commit": commit,
+        "config_file": str(args.config),
+        "config": cfg,
+        "task": task.name,
+        "k": args.k,
+        "layers": layers,
+        "floor": args.floor,
+        "gate": gate.as_dict(),
+        "data_paths": [str(p) for p in data_paths],
+        "data_hash_all": hash_examples(examples),
+        "n_examples": len(examples),
+        "resumed_completed_cells": len(done),
+    })
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+
+    if not gate.passed:
+        print("\n❌ LEARNABILITY GATE FAILED — refusing to launch the "
+              "benchmark. A probe cannot decode the task's features from "
+              "clean representations (or the shuffled-label control beat "
+              "chance, indicating leakage). Fix the task data; see "
+              "src/gates.py and the gate record in the manifest:")
+        print(f"   {manifest_path}")
+        sys.exit(2)
+
+    if not pending_layers:
+        print("\n✅ Nothing to do: all cells already completed "
+              f"({len(done)}/{total_cells}). Output: {out_path}")
+        return
+
     inter_cfg = InterventionConfig(
         inlp_iters=cfg["interventions"]["inlp"]["num_iters"],
         rlace_rank=cfg["interventions"]["rlace"]["rank"],
@@ -250,78 +445,71 @@ def main():
         pgd_alpha=cfg["interventions"]["pgd"]["alpha"],
     )
 
-    # Open results file in append mode so we can resume after interruption.
-    f_out = out_path.open("a")
+    n_written = 0
+    n_skipped = 0
+    # Append is safe now: completed cells were read into `done` above.
+    with out_path.open("a") as f_out:
+        for layer in pending_layers:
+            X_probe = reps_probe[layer]["X"]
+            zc_probe = reps_probe[layer]["zc"]
+            ze_probe = reps_probe[layer]["ze"]
+            X_inter = reps_inter[layer]["X"]
+            zc_inter = reps_inter[layer]["zc"]
+            ze_inter = reps_inter[layer]["ze"]
+            X_test = reps_test[layer]["X"]
+            zc_test = reps_test[layer]["zc"]
 
-    for layer in layers:
-        print(f"\n[layer {layer}] extracting representations...")
-        t0 = time.time()
-        X_probe, zc_probe, ze_probe = extract_layer_reps(
-            bundle, train_ex, layer_idx=layer,
-            batch_size=cfg["extraction"]["batch_size"],
-            max_length=cfg["extraction"]["max_length"],
-        )
-        X_inter, zc_inter, ze_inter = extract_layer_reps(
-            bundle, inter_ex, layer_idx=layer,
-            batch_size=cfg["extraction"]["batch_size"],
-            max_length=cfg["extraction"]["max_length"],
-            validate=False,
-        )
-        X_test, zc_test, _ = extract_layer_reps(
-            bundle, test_ex, layer_idx=layer,
-            batch_size=cfg["extraction"]["batch_size"],
-            max_length=cfg["extraction"]["max_length"],
-            validate=False,
-        )
-        print(f"[layer {layer}] extraction: {time.time() - t0:.1f}s")
+            # Validation probes & interventions are computed ONCE per layer.
+            # They depend only on the representations, not on the probe
+            # being evaluated.
+            set_seed(cfg["output"]["seed"])
+            val_probes = train_validation_probes(
+                X_probe, zc_probe, ze_probe, train_cfg, device, min_acc=0.0,
+            )
+            print(f"[layer {layer}] val probes: zc={val_probes.acc_zc:.3f} "
+                  f"ze={val_probes.acc_ze:.3f}")
 
-        # Validation probes & interventions are computed ONCE per layer.
-        # They depend only on the representations, not on the probe being evaluated.
-        val_cfg = ProbeTrainConfig(
-            epochs=cfg["probes"]["epochs"],
-            lr=cfg["probes"]["lr"],
-            weight_decay=cfg["probes"]["weight_decay"],
-            batch_size=cfg["probes"]["batch_size"],
-        )
-        val_probes = train_validation_probes(
-            X_probe, zc_probe, ze_probe, val_cfg, device, min_acc=0.0,
-        )
-        print(f"[layer {layer}] val probes: zc={val_probes.acc_zc:.3f} "
-              f"ze={val_probes.acc_ze:.3f}")
+            interventions_dict = run_all_interventions(
+                X_inter, zc_inter, val_probes.zc_probe, device, inter_cfg,
+            )
 
-        interventions_dict = run_all_interventions(
-            X_inter, zc_inter, val_probes.zc_probe, device, inter_cfg,
-        )
+            # K seeds × 3 architectures
+            for arch in ARCHS:
+                for k in range(args.k):
+                    seed = 1000 + k  # deterministic seed schedule
+                    if (layer, arch, seed) in done:
+                        n_skipped += 1
+                        continue
+                    t1 = time.time()
+                    row = run_one_cell(
+                        arch=arch, seed=seed,
+                        X_probe=X_probe, zc_probe=zc_probe, ze_probe=ze_probe,
+                        X_inter=X_inter, zc_inter=zc_inter, ze_inter=ze_inter,
+                        X_test=X_test, zc_test=zc_test,
+                        val_probes=val_probes,
+                        interventions_dict=interventions_dict,
+                        cfg=cfg, device=device, floor=args.floor,
+                    )
+                    row.update({
+                        "model": cfg["model"]["name"],
+                        "task": task.name,
+                        "layer": layer,
+                        "wallclock_s": time.time() - t1,
+                        "schema_version": SCHEMA_VERSION,
+                        "git_commit": commit,
+                    })
+                    f_out.write(json.dumps(row) + "\n")
+                    f_out.flush()
+                    n_written += 1
+                    r_str = "null" if row["R"] is None else f"{row['R']:.3f}"
+                    print(f"  L{layer} {arch:6s} seed={seed} "
+                          f"acc={row['accuracy']:.3f} A={row['A']:.3f} "
+                          f"R={r_str} ({row['R_method']}) "
+                          f"[{row['wallclock_s']:.1f}s]")
 
-        # K seeds × 3 architectures
-        for arch in archs:
-            for k in range(args.k):
-                seed = 1000 + k  # deterministic seed schedule
-                t1 = time.time()
-                row = run_one_cell(
-                    arch=arch, seed=seed,
-                    X_probe=X_probe, zc_probe=zc_probe, ze_probe=ze_probe,
-                    X_inter=X_inter, zc_inter=zc_inter, ze_inter=ze_inter,
-                    X_test=X_test, zc_test=zc_test,
-                    val_probes=val_probes,
-                    interventions_dict=interventions_dict,
-                    cfg=cfg, device=device,
-                )
-                row.update({
-                    "model": cfg["model"]["name"],
-                    "task": task.name,
-                    "layer": layer,
-                    "wallclock_s": time.time() - t1,
-                })
-                f_out.write(json.dumps(row) + "\n")
-                f_out.flush()
-                print(f"  L{layer} {arch:6s} seed={seed} "
-                      f"acc={row['accuracy']:.3f} A={row['A']:.3f} "
-                      f"R={row['R']:.3f} ({row['R_method']}) "
-                      f"[{row['wallclock_s']:.1f}s]")
-
-    f_out.close()
     print(f"\n✅ Benchmark complete: {out_path}")
+    print(f"   wrote {n_written} new cells, skipped {n_skipped} completed, "
+          f"total now {len(done) + n_written}/{total_cells}")
 
 
 if __name__ == "__main__":

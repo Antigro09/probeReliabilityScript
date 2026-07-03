@@ -38,3 +38,5 @@ Thumbs.db
 # Project specific
 *.log
 .env
+# Representation caches (large tensors; provenance sidecars regenerate them)
+cache/
