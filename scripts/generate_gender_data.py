@@ -101,8 +101,14 @@ def parse_args():
                         "between are NEUTRAL and dropped")
     p.add_argument("--out", type=Path,
                    default=PROJECT_ROOT / "data" / "gender.tsv")
-    p.add_argument("--min-examples", type=int, default=200,
-                   help="Refuse to write fewer examples than this")
+    p.add_argument("--min-examples", type=int, default=150,
+                   help="Refuse to write fewer examples than this. The "
+                        "occupation-referent Winogender subset with NEUTRAL "
+                        "occupations dropped yields 188 at the 60/40 BLS "
+                        "thresholds; the default guards against gross "
+                        "under-generation while accepting that full output. "
+                        "Tighter skew thresholds shrink the set — pass a "
+                        "lower value explicitly if you intend that.")
     return p.parse_args()
 
 
