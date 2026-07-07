@@ -3,7 +3,7 @@ Pre-registered predictor evaluation, v2 (locked).
 
 WHY a second evaluator: predictor_eval.py is locked to the v1
 pre-registration and REFUSES v2 records (schema_version >= 2). v2 changed the
-target: reliability R is now FLOORED and NULLABLE (src/metrics.py) — a cell
+target: reliability R is now FLOORED and NULLABLE (src/metrics.py) - a cell
 whose validation probe cannot decode the feature from clean representations
 yields R = None instead of the v1 constant-1.0 pathology. Correlating against a
 nullable target, and honestly accounting for the fact that R is shared across
@@ -32,7 +32,7 @@ What this script does differently from v1:
 Output: <input-dir>/PREREG_V2_OUTCOME.json plus a console summary.
 
 This script is LOCKED at v2 pre-registration time. Its thresholds and
-statistics must not change after the benchmark has been run — doing so
+statistics must not change after the benchmark has been run - doing so
 violates the pre-registration.
 """
 
@@ -80,7 +80,7 @@ P2_HITRATE = 0.50            # lock in PREREGISTRATION_v2.md
 # Distinct-R sanity gate: if the fraction of (model,layer,task) cells whose
 # floored R takes only ONE distinct value across archs×seeds is at or above
 # this, the target has no per-probe variance and the eval ABORTS. This is the
-# central v2 guard — without per-cell R variance, any A-vs-R correlation is a
+# central v2 guard - without per-cell R variance, any A-vs-R correlation is a
 # between-cell artifact, not evidence that A predicts probe reliability.
 DISTINCT_R_MIN = 0.50        # lock in PREREGISTRATION_v2.md
 # Resample budgets for the reported CI / permutation p. Analysis-power choices.
@@ -274,7 +274,7 @@ def main():
 
     rows = load_v2_rows(bench_dir)
     if not rows:
-        print(f"❌ No v2 benchmark results found in {bench_dir}")
+        print(f"[X] No v2 benchmark results found in {bench_dir}")
         print("   Run scripts/run_benchmark.py (writes schema v2) first.")
         sys.exit(1)
     print(f"Loaded {len(rows)} v2 probe records from {bench_dir}")
@@ -292,7 +292,7 @@ def main():
     print(f"  histogram (distinct-R per cell -> #cells): {gate['histogram']}")
     print(f"  degenerate (distinct-R==1): {gate['frac_degenerate']:.1%}  "
           f"(gate aborts at >= {gate['threshold']:.0%})")
-    print(f"  {'✅ PASS' if gate['passed'] else '❌ FAIL — no per-probe R variance'}")
+    print(f"  {'[OK] PASS' if gate['passed'] else '[X] FAIL - no per-probe R variance'}")
 
     if not gate["passed"]:
         outcome = classify_outcome(gate, {"met": False}, {"met": False})
@@ -340,14 +340,14 @@ def main():
               f"(excluded {p1['n_null']} null-R cells)")
     else:
         print(f"   {p1.get('reason', 'n/a')}  n = {p1.get('n', 0)}")
-    print(f"   {'✅ MET' if p1['met'] else '❌ NOT MET'}")
+    print(f"   {'[OK] MET' if p1['met'] else '[X] NOT MET'}")
 
     print(f"\nP2 (secondary): tie-aware rank-1 hit rate >= {P2_HITRATE:.0%}")
     print(f"   hit rate = {p2['hit_rate']:.3f} "
           f"({p2['hits']:.2f}/{p2['total']} cells)  "
           f"tie_fraction = {p2['tie_fraction']:.1%}  "
           f"skipped = {p2['n_skipped']}")
-    print(f"   {'✅ MET' if p2['met'] else '❌ NOT MET'}")
+    print(f"   {'[OK] MET' if p2['met'] else '[X] NOT MET'}")
 
     print("\n" + "=" * 70)
     print(f"  OUTCOME: {outcome}")

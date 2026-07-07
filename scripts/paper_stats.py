@@ -6,8 +6,8 @@ per-architecture, and per-layer-depth tables for reporting.
 
 The input directory is explicit (WS0.2): v1 and v2 records must never
 blend invisibly into one table. When pointed at v2 records, the LEGACY
-clipped reliability (R_legacy) is used for every row — uniform v1
-semantics, announced loudly — because this script's aggregations predate
+clipped reliability (R_legacy) is used for every row - uniform v1
+semantics, announced loudly - because this script's aggregations predate
 the floored metrics. Floored (nullable-R) analysis ships with the v2
 stats tooling (WS6).
 """
@@ -60,7 +60,7 @@ def load_records(bench_dir: Path):
                  f"keep record versions in separate directories.")
     if versions == {2}:
         print("=" * 70)
-        print("  NOTE: v2 records — using LEGACY clipped reliability "
+        print("  NOTE: v2 records - using LEGACY clipped reliability "
               "(R_legacy) for\n  every row so aggregations stay uniform and "
               "v1-comparable. Floored\n  (nullable) R analysis belongs to "
               "the v2 stats tooling (WS6).")
@@ -103,7 +103,7 @@ def hit_rate(cells, keys):
 
 
 # ==========================================================================
-# WS6 — honest v2 statistics
+# WS6 - honest v2 statistics
 #
 # WHY these exist: the exploratory helpers above treat every (A, R) pair as an
 # independent observation and pick arg-max by Python list order. Neither is
@@ -111,7 +111,7 @@ def hit_rate(cells, keys):
 #
 #   1. Pseudo-replication. R is computed once per (model, layer, task) cell
 #      from the layer's validation+data probes; it is IDENTICAL across the
-#      archs×seeds inside that cell (see run_benchmark.run_one_cell — per_method
+#      archs×seeds inside that cell (see run_benchmark.run_one_cell - per_method
 #      and hence R depend only on the pre-computed val_probes/interventions,
 #      not on the evaluated probe). So the 270 "pairs" are really ~cell-many
 #      independent draws. A naive Spearman p-value is anticonservative.
@@ -119,8 +119,8 @@ def hit_rate(cells, keys):
 #
 #   2. Tie-blind arg-max. predictor_eval.evaluate_p2 (lines 139-140) uses
 #      `max(cells, key=...)`, which returns the FIRST arg-max on ties. When
-#      several archs share the top A (or top R) — common once R is quantised
-#      per cell — that silently rewards list order. tie_aware_hit_rate scores
+#      several archs share the top A (or top R) - common once R is quantised
+#      per cell - that silently rewards list order. tie_aware_hit_rate scores
 #      the overlap fraction |argmaxA ∩ argmaxR| / |argmaxA| and reports how
 #      often ties happened.
 #
@@ -143,7 +143,7 @@ def cluster_bootstrap_spearman(pairs, cluster_ids, B: int = BOOTSTRAP_B,
                                seed: int = 0) -> dict:
     """Cluster (block) bootstrap of Spearman rho with a percentile 95% CI.
 
-    WHY: rows inside one (model, layer, task) cell are NOT independent — they
+    WHY: rows inside one (model, layer, task) cell are NOT independent - they
     share a single R value (see module note above). Resampling individual
     (A, R) pairs would pretend we have 270 independent observations and give a
     CI that is far too tight. Instead we resample whole clusters with
@@ -284,7 +284,7 @@ def tie_aware_hit_rate(cells_by_outer, tol: float = TIE_TOL) -> dict:
     """Tie-aware rank-1 agreement between arg-max-A and arg-max-R per outer cell.
 
     WHY: the v1 hit-rate (and predictor_eval.py:139-140) calls `max(...)`, which
-    breaks ties by list order — so on the very common case where R is identical
+    breaks ties by list order - so on the very common case where R is identical
     across archs (distinct-R == 1, see distinct_r_report) EVERY arch ties for
     max R, and list order alone decides the "winner". That inflates or deflates
     the hit rate arbitrarily. Here a hit is the OVERLAP fraction between the
@@ -343,7 +343,7 @@ def distinct_r_report(recs) -> dict:
     WHY (the headline defect): R is computed once per layer from the validation
     and intervention probes and is copied onto every arch×seed row in that cell
     (run_benchmark.run_one_cell). So within a cell the number of distinct R
-    values is expected to be 1 — meaning R carries NO per-probe information and
+    values is expected to be 1 - meaning R carries NO per-probe information and
     the whole "predict which probe is most reliable" framing has no target
     variance to predict. This report makes that visible instead of letting a
     healthy-looking Spearman hide it.
@@ -354,8 +354,8 @@ def distinct_r_report(recs) -> dict:
 
     Reads the honest floored/nullable R from "_R_floored" when present (WS6
     preserves it before load_records overwrites "R" with the legacy value on
-    v2 records); otherwise falls back to "R". Either way the defect — R being
-    constant across the archs×seeds inside a cell — shows identically.
+    v2 records); otherwise falls back to "R". Either way the defect - R being
+    constant across the archs×seeds inside a cell - shows identically.
 
     Args:
         recs: benchmark records (dicts) with keys model, layer, task, and R
@@ -422,7 +422,7 @@ def _v2_honest_stats_section(recs, cells):
     print(f"  cells: {dr['n_cells']}   "
           f"degenerate (distinct-R==1): {dr['frac_degenerate']:.1%}")
     if dr["frac_degenerate"] >= 0.5:
-        print("  ⚠ MOST cells have distinct-R == 1 — R is (near-)constant "
+        print("  [!] MOST cells have distinct-R == 1 - R is (near-)constant "
               "within a cell. Any A-vs-R correlation is BETWEEN cells only.")
 
     # ---- Cluster bootstrap of the headline Spearman. ----
@@ -455,7 +455,7 @@ def _v2_honest_stats_section(recs, cells):
           f"({th['hits']:.2f}/{th['total']} cells)  "
           f"tie_fraction={th['tie_fraction']:.1%}  skipped={th['n_skipped']}")
     if th["tie_fraction"] >= 0.5:
-        print("  ⚠ ties dominate: list-order max (predictor_eval.py:139-140) "
+        print("  [!] ties dominate: list-order max (predictor_eval.py:139-140) "
               "would be meaningless here.")
 
 
@@ -522,7 +522,7 @@ def main():
     # Iterate over the layer positions actually present rather than a hardcoded
     # range(1, 6): a partial run, a single model, or any model whose
     # select_layers returned fewer than 5 layers leaves higher positions empty,
-    # and statistics.median on the empty bucket raised StatisticsError — which
+    # and statistics.median on the empty bucket raised StatisticsError - which
     # aborted main() BEFORE the WS6 v2-honest-stats section below could run.
     # In the intended full 5-layer run the present positions are exactly
     # {1..5}, so this loop's output is unchanged.
