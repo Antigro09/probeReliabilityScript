@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from .probes import ProbeTrainConfig, probe_accuracy
+from .probes import ProbeTrainConfig, probe_accuracy, train_probe, LinearProbe, MLPProbe
 from .metrics import (
     ValidationProbes,
     train_validation_probes,
@@ -179,6 +179,25 @@ class Evaluator:
     acc_ze_oos: float
 
 
+def _train_certifier_pair(X, zc, ze, cfg, device, arch: str) -> ValidationProbes:
+    """Train a (zc, ze) certifier pair of the given arch on X. 'linear' matches
+    metrics.train_validation_probes; 'mlp' is needed for the non-linear
+    synthetic family (a linear certifier cannot read an XOR concept — WS5_DESIGN
+    §6.2, C-b'). Accuracies are in-sample here; the caller recomputes OOB."""
+    if arch == "linear":
+        return train_validation_probes(X, zc, ze, cfg, device, min_acc=0.0)
+    if arch != "mlp":
+        raise ValueError(f"certifier_arch must be 'linear' or 'mlp', got {arch!r}")
+    dim = X.shape[1]
+    zc_p = MLPProbe(dim).to(device)
+    train_probe(zc_p, X, zc, cfg, device)
+    ze_p = MLPProbe(dim).to(device)
+    train_probe(ze_p, X, ze, cfg, device)
+    return ValidationProbes(zc_p, ze_p,
+                            probe_accuracy(zc_p, X, zc, device),
+                            probe_accuracy(ze_p, X, ze, device))
+
+
 def train_independent_evaluators(
     X_eval: torch.Tensor,
     zc_eval: torch.Tensor,
@@ -190,6 +209,7 @@ def train_independent_evaluators(
     min_acc: float = EVAL_MIN_ACC,
     seed_base: int = EVAL_SEED_BASE,
     clone_cos_max: float = CLONE_COS_MAX,
+    certifier_arch: str = "linear",
 ) -> list[Evaluator]:
     """Train `n_evaluators` certifier pairs, each on an independent bootstrap
     resample (bagging) of the clean evaluator fold `X_eval`.
@@ -218,9 +238,9 @@ def train_independent_evaluators(
             # Degenerate bag (almost no out-of-bag); widen deterministically.
             oob_idx = torch.arange(n)[::5]
 
-        vp = train_validation_probes(
+        vp = _train_certifier_pair(
             X_eval[bag_idx], zc_eval[bag_idx], ze_eval[bag_idx],
-            cfg, device, min_acc=0.0,   # we gate on OOB accuracy below, not this print-only warn
+            cfg, device, certifier_arch,   # OOB accuracy gate below, not the print-only warn
         )
         acc_zc_oos = probe_accuracy(vp.zc_probe, X_eval[oob_idx], zc_eval[oob_idx], device)
         acc_ze_oos = probe_accuracy(vp.ze_probe, X_eval[oob_idx], ze_eval[oob_idx], device)
@@ -232,13 +252,20 @@ def train_independent_evaluators(
             )
         evaluators.append(Evaluator(vp, seed, acc_zc_oos, acc_ze_oos))
 
-    _assert_not_clones(evaluators, clone_cos_max)
+    # Clone check only meaningful for linear certifiers (a discriminant
+    # direction). MLP certifiers get their independence from bagging; skip.
+    if certifier_arch == "linear":
+        _assert_not_clones(evaluators, clone_cos_max)
     return evaluators
 
 
 def _discriminant(vp: ValidationProbes) -> torch.Tensor:
-    w = vp.zc_probe.linear.weight.detach().cpu()   # (2, D)
-    v = (w[1] - w[0])
+    z = vp.zc_probe
+    if hasattr(z, "linear"):
+        w = z.linear.weight.detach().cpu()   # (2, D)
+        v = w[1] - w[0]
+    else:                                    # MLP/MKA: use the flat parameter vector as a proxy
+        v = z.flat_params().cpu()
     return v / (v.norm() + 1e-9)
 
 

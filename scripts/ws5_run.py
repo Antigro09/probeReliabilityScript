@@ -124,6 +124,10 @@ def run_replicate(family, alpha, replicate, args, device, train_cfg, probe_cfg, 
         evaluators = train_independent_evaluators(
             X_eval, zc_eval, ze_eval, train_cfg, device,
             n_evaluators=args.evaluators, seed_base=EVAL_SEED_BASE + 37 * replicate,
+            # A linear certifier cannot read an XOR concept -> MLP certifiers for
+            # the non-linear family (WS5_DESIGN §6.2). rho_rec uses the planted
+            # subspace, so the candidate direction is still compared to truth.
+            certifier_arch=("mlp" if family == "nonlinear" else "linear"),
         )
     except EvaluatorQualityError as e:
         print(f"[eval] replicate {replicate} alpha={alpha} invalid: {e}")
