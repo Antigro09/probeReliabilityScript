@@ -82,14 +82,23 @@ def test_v1_truncated_prefix_rejected(tmp_path):
         task.load([_write(tmp_path, lines)], max_examples=None, seed=0)
 
 
-def test_actual_v1_repo_data_is_rejected():
-    """The broken v1 file still in data/ must not load under the v2 loader."""
-    v1 = PROJECT_ROOT / "data" / "gender.tsv"
-    if not v1.exists():
-        pytest.skip("v1 data file not present")
+def test_repo_gender_data_is_valid_v2():
+    """The gender.tsv shipped in data/ has been REGENERATED to the valid v2
+    artifact (full-sentence, pronoun included, no NEUTRAL, no both-labels rows),
+    so the strict v2 loader must accept it and its validation must pass. The
+    rejection guards for broken data are covered by the tmp_path tests above."""
+    f = PROJECT_ROOT / "data" / "gender.tsv"
+    if not f.exists():
+        pytest.skip("gender data file not present")
     task = get_task("gender")
-    with pytest.raises(ValueError):
-        task.load([v1], max_examples=None, seed=0)
+    examples = task.load([f], max_examples=None, seed=0)
+    assert len(examples) > 0
+    # every example carries a pronoun consistent with its label and one zc per sentence
+    zc_by_sentence = {}
+    for ex in examples:
+        assert ex.zc in (0, 1) and ex.ze in (0, 1)
+        zc_by_sentence.setdefault(ex.sentence, set()).add(ex.zc)
+    assert all(len(v) == 1 for v in zc_by_sentence.values())
 
 
 def test_malformed_line_rejected(tmp_path):

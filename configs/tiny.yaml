@@ -40,7 +40,7 @@ probes:
 
 mka:
   knn_k: 5
-  lambda_reg: 0.1
+  lambda_reg: 0.5
 
 hessian:
   top_n: 5
