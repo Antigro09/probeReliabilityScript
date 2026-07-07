@@ -89,20 +89,32 @@ def parse_args():
 
 
 def split_4way(examples, fracs, seed):
-    """Deterministic (zc,ze)-stratified 4-way split.
+    """Deterministic, class-BALANCED, (zc,ze)-stratified 4-way split.
 
     Returns (candidate, evaluator, intervention, test) example lists, disjoint.
-    Stratifying by (zc,ze) keeps all four folds balanced even for small tasks
-    (e.g. gender, 188 examples).
+
+    The four (zc,ze) cells are first balanced to the minimum cell count (as the
+    v1 runner's _split_balanced_4cell does) so BOTH zc and ze are ~50/50. This
+    matters because the learnability gate and the metric floors use chance=0.5:
+    on imbalanced data (Linzen SVA is zc 34/66, ze 32/69) a majority-class
+    guesser scores at the imbalance rate, which spuriously (a) passes the 0.60
+    floor without learning and (b) fails the shuffled-label control (a shuffled
+    probe predicts the majority class, beating 0.5). Balancing makes 0.5 the
+    correct baseline. Each balanced cell is then split by the fractions, so the
+    four folds are class-balanced AND input-disjoint (given upstream dedup).
     """
     rng = random.Random(seed)
     buckets = defaultdict(list)
     for ex in examples:
         buckets[(ex.zc, ex.ze)].append(ex)
+    four = [(0, 0), (0, 1), (1, 0), (1, 1)]
+    if all(k in buckets and buckets[k] for k in four):
+        min_n = min(len(buckets[k]) for k in four)
+        buckets = {k: (rng.sample(buckets[k], len(buckets[k])))[:min_n] for k in four}
     folds = {"candidate": [], "evaluator": [], "intervention": [], "test": []}
     order = ["candidate", "evaluator", "intervention", "test"]
     for key in sorted(buckets):
-        grp = buckets[key]
+        grp = list(buckets[key])
         rng.shuffle(grp)
         n = len(grp)
         n_c = int(fracs["candidate"] * n)
@@ -197,6 +209,24 @@ def main():
     examples = task.load(data_paths, max_examples=cfg["data"].get("max_examples"),
                          seed=cfg["data"]["seed"])
     print(f"[data] loaded {len(examples)} examples from {[str(p) for p in data_paths]}")
+
+    # Deduplicate by sentence so the 4-way folds are INPUT-DISJOINT. Templated
+    # data (Linzen SVA is ~14% repeated sentences) otherwise puts identical
+    # inputs in different folds, leaking label information across the
+    # candidate/evaluator/intervention boundary and inflating every metric — the
+    # learnability gate's shuffled-label control catches it (shuffled acc ~0.63
+    # instead of ~0.5). Keep the first occurrence of each sentence.
+    seen: set = set()
+    deduped = []
+    for ex in examples:
+        if ex.sentence in seen:
+            continue
+        seen.add(ex.sentence)
+        deduped.append(ex)
+    if len(deduped) < len(examples):
+        print(f"[dedup] {len(examples)} -> {len(deduped)} unique sentences "
+              f"({1 - len(deduped)/len(examples):.1%} duplicates removed)")
+    examples = deduped
 
     cand_ex, eval_ex, inter_ex, test_ex = split_4way(
         examples, SPLIT_FRACS, seed=cfg["data"]["seed"])

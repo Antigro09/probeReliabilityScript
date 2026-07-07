@@ -106,7 +106,14 @@ data). k>2 counterfactual raises (binary v2 scope).
   `{candidate: 0.40, evaluator: 0.20, intervention: 0.30, test: 0.10}`.
   The candidate trains on the candidate fold; evaluators (bagged) on the
   evaluator fold; the edit is applied and C/S measured on the intervention
-  fold; candidate accuracy on the test fold. This is a v2 pipeline change;
+  fold; candidate accuracy on the test fold. Before splitting, examples are
+  **deduplicated by sentence** (templated data such as Linzen SVA is ~14%
+  repeated; duplicates straddling folds leak label information) and the four
+  `(zc,ze)` cells are **balanced to the minimum cell count** (as the v1
+  `_split_balanced_4cell` does) so both zc and ze are ~50/50 and `chance = 0.5`
+  is the correct baseline for the floors and the shuffled-label control — on the
+  raw imbalanced data (SVA zc 34/66) a majority guesser would spuriously pass
+  the floor and trip the shuffle control. This is a v2 pipeline change;
   v1↔v2 candidate accuracies are **not** claimed comparable.
 - **Learnability gate (WS2):** before launch, a linear probe at the middle
   probed layer must reach the registered floors and a shuffled-label control
