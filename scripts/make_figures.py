@@ -5,6 +5,9 @@ Reads results/benchmark_v2/*.jsonl (schema v2, repaired) and, if present, the
 synthetic head-to-head (results/ws5/headtohead_*.json), and writes PNGs to
 results/figures/.
 
+Palette matches the paper's house style:
+    Linear  -> gray      MLP -> salmon      MKA -> crimson    trend -> red dashed
+
 Figures:
   fig1_A_vs_Rcand   - the null result: A vs repaired R_cand (cell medians), per task.
   fig2_ladder       - rho(A, rung) across the decomposition ladder (the money plot).
@@ -21,6 +24,7 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -30,7 +34,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUT = PROJECT_ROOT / "results" / "figures"
 OUT.mkdir(parents=True, exist_ok=True)
 
-ARCH_COLOR = {"linear": "#4C72B0", "mlp": "#DD8452", "mka": "#55A868"}
+# Paper house palette.
+GRAY = "#808080"
+SALMON = "#E8A0A0"
+CRIMSON = "#D1495B"
+TREND = "#D62728"   # red dashed trend/reference lines
+
+ARCH_COLOR = {"linear": GRAY, "mlp": SALMON, "mka": CRIMSON}
+ARCH_LABEL = {"linear": "Linear", "mlp": "MLP", "mka": "MKA"}
+ARCH_MARKER = {"linear": "o", "mlp": "s", "mka": "^"}
 
 
 def load_rows():
@@ -61,15 +73,30 @@ def _rho(cm, x, y):
     return float(r), float(p), len(pts)
 
 
+def _trend(ax, xs, ys):
+    """Red dashed least-squares trend line over the facet's points."""
+    if len(xs) < 3:
+        return
+    xs = np.asarray(xs, float); ys = np.asarray(ys, float)
+    b, a = np.polyfit(xs, ys, 1)
+    xline = np.linspace(xs.min(), xs.max(), 50)
+    ax.plot(xline, b * xline + a, "--", color=TREND, lw=1.6, zorder=1)
+
+
 def fig1_scatter(cm):
     tasks = sorted({k[2] for k in cm})
     fig, axes = plt.subplots(1, len(tasks), figsize=(4.2 * len(tasks), 4), squeeze=False)
     for ax, task in zip(axes[0], tasks):
         sub = {k: v for k, v in cm.items() if k[2] == task and "R_cand" in v}
+        allx, ally = [], []
         for arch in ARCH_COLOR:
             xs = [v["A"] for k, v in sub.items() if k[3] == arch]
             ys = [v["R_cand"] for k, v in sub.items() if k[3] == arch]
-            ax.scatter(xs, ys, s=28, alpha=0.75, color=ARCH_COLOR[arch], label=arch, edgecolor="none")
+            ax.scatter(xs, ys, s=34, alpha=0.85, color=ARCH_COLOR[arch],
+                       marker=ARCH_MARKER[arch], label=ARCH_LABEL[arch],
+                       edgecolor="#333333", linewidth=0.4, zorder=3)
+            allx += xs; ally += ys
+        _trend(ax, allx, ally)
         r, p, n = _rho(sub, "A", "R_cand")
         ax.set_title(f"{task}   rho={r:.2f} (p={p:.2f}, n={n})", fontsize=10)
         ax.set_xlabel("alignment A"); ax.set_ylabel("repaired reliability R_cand")
@@ -87,11 +114,11 @@ def fig2_ladder(cm):
     for key, lab in rungs:
         r, p, n = _rho(cm, "A", key)
         vals.append(r); labels.append(f"{lab}\nrho={r:+.2f}" + ("*" if p < 0.05 else ""))
-        cols.append("#C44E52" if p < 0.05 else "#8C8C8C")
+        cols.append(CRIMSON if p < 0.05 else GRAY)
     fig, ax = plt.subplots(figsize=(7, 4.2))
-    ax.bar(range(len(vals)), vals, color=cols, width=0.6)
+    ax.bar(range(len(vals)), vals, color=cols, width=0.6, edgecolor="#333333", linewidth=0.4)
     ax.axhline(0, color="k", lw=0.8)
-    ax.axhline(0.5, color="green", lw=0.8, ls="--", label="prereg threshold (0.5)")
+    ax.axhline(0.5, color=TREND, lw=1.3, ls="--", label="prereg threshold (0.5)")
     ax.set_xticks(range(len(vals))); ax.set_xticklabels(labels, fontsize=8)
     ax.set_ylabel("Spearman rho(A, target)"); ax.set_ylim(-0.5, 0.6)
     ax.set_title("What A correlates with: significant & NEGATIVE vs v1, null vs repaired")
@@ -105,9 +132,11 @@ def fig3_arch(rows):
     medA = [statistics.median([r["A"] for r in rows if r["arch"] == a]) for a in archs]
     medR = [statistics.median([r["R_cand"] for r in rows if r["arch"] == a and r["R_cand"] is not None]) for a in archs]
     ax2 = ax.twinx()
-    ax.plot(archs, medA, "o-", color="#4C72B0", label="median A")
-    ax2.plot(archs, medR, "s--", color="#C44E52", label="median R_cand")
-    ax.set_ylabel("median A", color="#4C72B0"); ax2.set_ylabel("median R_cand", color="#C44E52")
+    # alignment = crimson (matches the paper's "MKA"/alignment line); reliability = salmon
+    ax.plot([ARCH_LABEL[a] for a in archs], medA, "o-", color=CRIMSON, lw=2, label="median A")
+    ax2.plot([ARCH_LABEL[a] for a in archs], medR, "s--", color=SALMON, lw=2, label="median R_cand")
+    ax.set_ylabel("median alignment A", color=CRIMSON); ax.tick_params(axis="y", labelcolor=CRIMSON)
+    ax2.set_ylabel("median R_cand", color=SALMON); ax2.tick_params(axis="y", labelcolor="#B06A6A")
     ax.set_title("Higher capacity: more reliable (R_cand up) but less aligned (A down)")
     ax.grid(alpha=0.25)
     fig.tight_layout(); fig.savefig(OUT / "fig3_arch.png", dpi=150); plt.close(fig)
@@ -123,12 +152,12 @@ def fig4_synth():
         tau = d.get("tau", {})
         order = ["R_v1_max", "R_v1_mean", "R_excl", "R_cand"]
         vals = [tau.get(k, float("nan")) for k in order]
-        cols = ["#8C8C8C", "#8C8C8C", "#8C8C8C", "#55A868"]
-        ax.bar(order, vals, color=cols, width=0.6)
-        ax.axhline(0.5, color="green", ls="--", lw=0.8)
+        cols = [GRAY, GRAY, GRAY, CRIMSON]   # highlight the repaired metric
+        ax.bar(order, vals, color=cols, width=0.6, edgecolor="#333333", linewidth=0.4)
+        ax.axhline(0.5, color=TREND, ls="--", lw=1.3)
         fam = Path(f).stem.replace("headtohead_", "")
         dt = d.get("delta_tau_R_cand_minus_v1max")
-        ax.set_title(f"synthetic ({fam})\nKendall tau vs ground truth  (delta={dt:.2f})" if dt else fam, fontsize=9)
+        ax.set_title(f"synthetic ({fam})\nKendall tau vs ground truth  (delta={dt:.2f})" if dt is not None else fam, fontsize=9)
         ax.set_ylabel("tau(rung, true recovery)"); ax.tick_params(axis="x", labelrotation=20)
         ax.grid(axis="y", alpha=0.25)
     fig.suptitle("Synthetic validation: R_cand tracks ground-truth recovery; v1 max does not", fontsize=11)
