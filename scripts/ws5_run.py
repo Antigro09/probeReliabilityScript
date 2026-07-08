@@ -112,12 +112,17 @@ def run_replicate(family, alpha, replicate, args, device, train_cfg, probe_cfg, 
     X_eval, zc_eval, ze_eval = folds["eval"]["X"], folds["eval"]["zc"], folds["eval"]["ze"]
     X_inter, zc_inter, ze_inter = folds["inter"]["X"], folds["inter"]["zc"], folds["inter"]["ze"]
 
-    # WS2 learnability gate on the eval env (must decode the concept there)
-    gate = learnability_gate(X_eval, zc_eval, ze_eval, device, train_cfg,
-                             zc_floor=0.60, ze_floor=0.55, chance=0.5)
-    if not gate.passed:
-        print(f"[gate] replicate {replicate} alpha={alpha} FAILED: {gate.report()}")
-        return [], {"gate_passed": False}
+    # WS2 learnability gate on the eval env (must decode the concept there).
+    # SKIP for the non-linear (XOR) family: that concept is intentionally NOT
+    # linearly decodable, so the linear gate probe would always fail (~chance).
+    # Decodability is instead enforced by the MLP-certifier quality gate
+    # (EVAL_MIN_ACC) in train_independent_evaluators below.
+    if family != "nonlinear":
+        gate = learnability_gate(X_eval, zc_eval, ze_eval, device, train_cfg,
+                                 zc_floor=0.60, ze_floor=0.55, chance=0.5)
+        if not gate.passed:
+            print(f"[gate] replicate {replicate} alpha={alpha} FAILED: {gate.report()}")
+            return [], {"gate_passed": False}
 
     # Certifiers (bagged, once per replicate)
     try:

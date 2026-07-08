@@ -107,21 +107,30 @@ def _sample_linear(cfg, dirs, alpha, generator) -> dict:
 
 
 def _sample_nonlinear(cfg, dirs, alpha, generator) -> dict:
-    """XOR concept: y = XOR(a>0, b>0) with latent coords along v_a, v_b.
-    Ground truth is the 2-D subspace span(v_a, v_b)."""
+    """XOR concept: zc = XOR(sa, sb) with the two latent bits placed at ±mu_c
+    along v_a and v_b (bimodal, cleanly separated), so the concept is genuinely
+    non-linear (the 4 quadrants form an XOR, not linearly separable) yet an MLP
+    certifier can learn it. Ground truth is the 2-D subspace span(v_a, v_b).
+
+    Drawing a,b ~ N(0,1) instead (continuous) puts most mass near the decision
+    axes, where XOR labels are ambiguous under noise, and even an MLP then sits
+    near chance — which stalls the whole non-linear family. The bimodal design
+    fixes that while keeping the concept non-linear."""
     v_a, v_b, v_e, v_s = dirs["v_a"], dirs["v_b"], dirs["v_e"], dirs["v_s"]
     N, D = cfg.N, cfg.D
-    a = torch.randn(N, generator=generator)
-    b = torch.randn(N, generator=generator)
-    y = ((a > 0) ^ (b > 0)).long()
+    sa = torch.randint(0, 2, (N,), generator=generator)
+    sb = torch.randint(0, 2, (N,), generator=generator)
+    y = (sa ^ sb).long()                          # XOR — not linearly separable
     e = torch.randint(0, 2, (N,), generator=generator)
     agree = (torch.rand(N, generator=generator) < alpha).long()
     s = torch.where(agree == 1, y, 1 - y)
 
+    ca = ((2 * sa - 1).float() * cfg.mu_c).unsqueeze(1)   # ±mu_c along v_a
+    cb = ((2 * sb - 1).float() * cfg.mu_c).unsqueeze(1)   # ±mu_c along v_b
     se = (2 * e - 1).float().unsqueeze(1)
     ss = (2 * s - 1).float().unsqueeze(1)
     noise = torch.randn(N, D, generator=generator) * cfg.sigma
-    X = (a.unsqueeze(1) * v_a + b.unsqueeze(1) * v_b
+    X = (ca * v_a + cb * v_b
          + cfg.mu_e * se * v_e + cfg.mu_s * ss * v_s + noise)
     return {"X": X.float(), "zc": y.long(), "ze": e.long()}
 
