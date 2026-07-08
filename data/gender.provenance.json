@@ -1,0 +1,34 @@
+{
+  "generator": "scripts/generate_gender_data.py",
+  "git_commit": "1f68c215518a14f7f40f4d1654e7a24d39925403",
+  "templates": "C:\\Users\\antho\\Documents\\Projects\\AI Research\\probeReliabilityScript\\data\\winogender\\templates.tsv",
+  "stats": "C:\\Users\\antho\\Documents\\Projects\\AI Research\\probeReliabilityScript\\data\\winogender\\occupations-stats.tsv",
+  "stat_source": "bls",
+  "style": "full-sentence",
+  "referent": "occupation",
+  "fem_threshold": 60.0,
+  "masc_threshold": 40.0,
+  "dropped_neutral_occupations": [
+    "accountant",
+    "administrator",
+    "appraiser",
+    "auditor",
+    "bartender",
+    "broker",
+    "dispatcher",
+    "investigator",
+    "pharmacist",
+    "salesperson",
+    "scientist",
+    "specialist",
+    "technician"
+  ],
+  "n_examples": 188,
+  "cell_counts": {
+    "FEM/FEM_SKEW": 46,
+    "FEM/MASC_SKEW": 48,
+    "MASC/FEM_SKEW": 46,
+    "MASC/MASC_SKEW": 48
+  },
+  "source_attribution": "Rudinger et al., NAACL 2018 (winogender-schemas)"
+}
