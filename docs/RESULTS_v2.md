@@ -1,8 +1,9 @@
 # v2 Results — Alignment does NOT predict repaired probe reliability
 
-Run: `scripts/ws8_rerun.py` at tag `prereg-v2`. Records: `results/benchmark_v2/`
-(2820 probe records, 141 cells). Locked evaluator: `scripts/prereg_v2_eval.py`
-→ `results/benchmark_v2/PREREG_V2_OUTCOME.json`.
+Run: `scripts/ws8_rerun.py` at tag `prereg-v2` (+ the Gemma left-padding fix).
+Records: `results/benchmark_v2/` (**3360 probe records, 168 cells, all 6 models**).
+Locked evaluator: `scripts/prereg_v2_eval.py` →
+`results/benchmark_v2/PREREG_V2_OUTCOME.json`. Figures: `results/figures/`.
 
 ## Headline: OUTCOME = NEGATIVE (the informative kind)
 
@@ -10,9 +11,12 @@ Run: `scripts/ws8_rerun.py` at tag `prereg-v2`. Records: `results/benchmark_v2/`
   per probe — the v1 defect (R identical across archs/seeds in a cell) is fixed.
   So the target is legitimate, and the negative result is *about the predictor*,
   not an artifact of a broken metric.
-- **P1 (primary) NOT MET:** Spearman ρ(A, R_cand) = **0.009**, permutation
-  p = 0.92, cluster-bootstrap 95% CI [−0.20, 0.21], n = 141 cells.
-- **P2 (secondary) NOT MET:** tie-aware rank-1 hit rate = 0.38 (< 0.50).
+- **P1 (primary) NOT MET:** Spearman ρ(A, R_cand) = **−0.042**, permutation
+  p = 0.59, cluster-bootstrap 95% CI [−0.23, 0.15], n = 168 cells.
+- **P2 (secondary) NOT MET:** tie-aware rank-1 hit rate = 0.375 (< 0.50).
+
+(The 5-model result before the Gemma fix was ρ = +0.009; adding Gemma left it
+firmly null — the finding is robust to the model set.)
 
 The synthetic study (`scripts/ws5_run.py`) separately established that R_cand is
 a *valid* metric: it ranks probes by ground-truth causal recovery at Kendall
@@ -22,16 +26,16 @@ the prereg rubric's "R_rep valid yet A does not predict it" row.
 
 ## The decomposition ladder (why this matters)
 
-ρ(A, ·) over 141 cell medians:
+ρ(A, ·) over 168 cell medians (6 models):
 
 | target | ρ | p | note |
 |---|---|---|---|
-| R_cand (repaired, per-probe, validated) | +0.009 | 0.92 | **no relationship** |
-| R_excl (INLP/RLACE, per-cell) | −0.155 | 0.07 | ~null |
-| R_v1_max (v1-style max-over-5, broken) | **−0.368** | **<0.001** | significant but **wrong sign** |
-| accuracy | +0.093 | 0.27 | null |
+| R_cand (repaired, per-probe, validated) | −0.042 | 0.59 | **no relationship** |
+| R_excl (INLP/RLACE, per-cell) | −0.149 | 0.05 | ~null |
+| R_v1_max (v1-style max-over-5, broken) | **−0.322** | **<0.001** | significant but **wrong sign** |
+| accuracy | +0.118 | 0.13 | null |
 
-And ρ(accuracy, R_cand) = **−0.303** (p < 0.001): *more accurate probes are less
+And ρ(accuracy, R_cand) = **−0.190** (p = 0.014): *more accurate probes are less
 reliable* by R_cand — consistent with high-fit probes leaning on shortcuts whose
 directions are less causally clean.
 
@@ -59,19 +63,23 @@ The paper's honest contribution: *a repaired, probe-dependent, ground-truth-
 validated reliability metric, and the finding that geometric/curvature alignment
 does not transfer to operational probe selection under it.*
 
-## Data caveats (both caught by the WS2 learnability gate)
+## Data notes
 
-- **gemma-2-2b: EXCLUDED.** zc decodes at chance (~0.50) at the middle layer for
-  every task → degenerate extraction (a known Gemma-2 hidden-state issue; likely
-  attention soft-capping / bf16 / BOS handling). The gate refused it rather than
-  emitting v1-style garbage. Fixing Gemma extraction is a follow-up.
-- **gender: UNDERPOWERED.** 188 examples → tiny balanced 4-way folds; only
-  pythia (120) and gpt2 (120) cells survived the gate. The full-sentence,
-  last-token design needs more data or larger models. gender ρ = −0.51 on 12
-  cells (p = 0.09) is not interpretable.
+- **gemma-2-2b: RECOVERED.** Initially gate-refused (zc at chance ~0.50 on every
+  task). Root cause was a real bug: `_last_token_hidden` used
+  `attention_mask.sum()-1`, correct only for right-padding, but Gemma's tokenizer
+  left-pads, so extraction landed mid-sequence and collapsed the reps. Fixed to
+  compute the last real-token index for either padding side (a no-op for the 5
+  right-padded models). Post-fix Gemma decodes SVA at 0.84–0.89 and contributes
+  sva (240) + sst2 (300) cells. The WS2 gate correctly refused the garbage until
+  the bug was fixed — it never entered the results silently.
+- **gender: UNDERPOWERED.** 188 examples → tiny balanced 4-way folds; only pythia
+  and gpt2 survived the gate (gemma/bert/qwen gender gate-failed; llama gender
+  produced 0 usable cells). The full-sentence, last-token design needs more data
+  or is dropped. Gender is not interpretable at this N.
 
-Usable models: pythia, gpt2, bert, qwen, llama (5). Tasks with broad coverage:
-SVA, SST-2.
+All 6 models contribute (via SVA and/or SST-2); SVA and SST-2 have broad
+coverage. The negative result holds across the full model set.
 
 ## Reproduce
 
