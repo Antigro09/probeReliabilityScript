@@ -19,10 +19,14 @@ Locked evaluator: `scripts/prereg_v2_eval.py` →
 firmly null — the finding is robust to the model set.)
 
 The synthetic study (`scripts/ws5_run.py`) separately established that R_cand is
-a *valid* metric: it ranks probes by ground-truth causal recovery at Kendall
-τ = 0.74, beating v1 max-R (τ = 0.18) with Δτ = 0.55, CI [0.33, 0.82]. So A
-fails against a **correct** target — the sharpest possible negative, and exactly
-the prereg rubric's "R_rep valid yet A does not predict it" row.
+a *valid* metric. It ranks probes by ground-truth causal recovery at Kendall
+τ = 0.80 (linear, n=2,880) and τ = 0.75 (held-out non-linear/XOR with MLP
+certifiers, n=540), vs v1 max-R at τ ≈ 0.04; the paired advantage Δτ = 0.76,
+CI [0.66, 0.85] (linear) and 0.70, CI [0.59, 0.83] (non-linear). The
+confident-shortcut **dissociation** check passes on the non-linear family (112
+high-A / low-R_cand cells), so R_cand is not a relabeling of A. So A fails
+against a **correct, non-circular** target — the sharpest possible negative, and
+exactly the prereg rubric's "R_rep valid yet A does not predict it" row.
 
 ## The decomposition ladder (why this matters)
 

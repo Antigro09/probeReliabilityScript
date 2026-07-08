@@ -1,9 +1,9 @@
 # Draft results section (v2) — for the paper
 
-Camera-ready-ish prose for the results section. Numbers are from the locked
-v2 run (`prereg-v2` + the Gemma left-padding fix); synthetic numbers marked
-[pilot] are from a 3-replicate pilot and will be replaced by the full
-R=20/S=8 run when it completes. Figures: `results/figures/fig{1,2,3,4}`.
+Camera-ready-ish prose for the results section. All numbers are from the locked
+v2 run (`prereg-v2` + the Gemma left-padding fix) and the full synthetic study
+(linear R=20/S=8, n=2,880; held-out non-linear family with MLP certifiers,
+n=540). Figures: `results/figures/fig0` (methods pipeline) and `fig{1,2,3,4}`.
 
 ---
 
@@ -32,16 +32,25 @@ axis. The generator plants an invariant causal direction v_c, a label-uncorrelat
 selectivity axis v_e, and a spurious shortcut axis v_s whose label-correlation
 differs between the candidate's training environment and the evaluators'
 environment, so that v_c is identifiable as the invariant predictor. Ground truth
-is each probe's recovery of v_c. R_cand ranks probes by ground-truth recovery at
-Kendall τ = 0.74 [pilot], substantially above the v1 max-over-methods metric
-(τ = 0.18 [pilot]); the paired advantage Δτ = 0.55, 95% CI [0.33, 0.82] [pilot],
-excludes zero. A five-check battery passes (reliability ICC ≈ 0.98, no
-saturation, shuffled-label candidates collapse, random directions score at the
-D-dependent chance floor); the confident-shortcut *dissociation* check — a probe
-that is confident on the shortcut (high alignment) but recovers no causal signal
-(low R_cand) — is exercised on a held-out non-linear generator with non-linear
-certifiers. Crucially, the alignment score A is never computed in this validation,
-so R_cand's validity does not depend on the hypothesis under test.
+is each probe's recovery of v_c. On a linear-Gaussian generator, R_cand ranks
+probes by ground-truth recovery at Kendall τ = 0.80 (n = 2,880 candidates), far
+above the v1 max-over-methods metric (τ = 0.04); the paired advantage Δτ = 0.76,
+95% CI [0.66, 0.85], excludes zero. The reliability battery passes (ICC = 0.99;
+shuffled-label candidates collapse below 0.10; random directions score at the
+D-dependent chance floor). On a held-out non-linear (XOR) generator with
+non-linear certifiers the ranking holds (τ = 0.75, Δτ = 0.70, CI [0.59, 0.83]),
+and — decisively — the confident-shortcut *dissociation* check passes: probes
+confident on the spurious shortcut (high alignment A) but with no true causal
+recovery receive low R_cand (112 such high-A / low-R_cand cells). R_cand is thus
+*not* a relabeling of A, so an empirical A↔R_cand correlation would be a genuine
+finding rather than an artifact. Crucially, A is never computed anywhere in this
+validation, so R_cand's validity does not depend on the hypothesis under test.
+
+An auxiliary attacker/evaluator control confirms the specific confound R_cand is
+designed to avoid: scoring an intervention with the *same* probe that generated
+it inflates completeness relative to an *independent* evaluator (AlterRep on
+BERT/SVA: matched C = 1.00 vs split C = 0.86, gap 0.14), which is why R_cand
+certifies every edit with disjoint, independently-seeded evaluator probes.
 
 ## Alignment does not predict repaired reliability
 
