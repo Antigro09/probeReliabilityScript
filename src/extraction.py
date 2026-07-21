@@ -190,11 +190,21 @@ def _last_token_hidden(hidden_states: torch.Tensor,
     """
     hidden_states: (B, T, H), attention_mask: (B, T) with 1 for real tokens.
     Returns (B, H): hidden state at the LAST real token in each sequence.
+
+    The last real token is the last index where attention_mask == 1, computed
+    robustly for BOTH padding sides. The naive `attention_mask.sum(1) - 1` is
+    only correct for RIGHT padding (real tokens first); models that LEFT-pad
+    (e.g. Gemma-2, whose tokenizer defaults to padding_side='left') put real
+    tokens at the END, so sum()-1 lands mid-sequence and collapses the reps to
+    near-identical vectors (Gemma decoded at chance until this was fixed). For
+    right-padded models this formula is identical to sum()-1, so it is a no-op
+    for BERT/GPT-2/Pythia/Qwen/LLaMA.
     """
-    # last_idx[b] = index of last 1 in attention_mask[b]
-    seq_lens = attention_mask.sum(dim=1) - 1  # (B,)
+    seq_len = attention_mask.shape[1]
+    # position of the last 1 = T-1 minus the offset of the first 1 from the right
+    last_idx = seq_len - 1 - attention_mask.flip(dims=[1]).long().argmax(dim=1)
     batch_idx = torch.arange(hidden_states.shape[0], device=hidden_states.device)
-    return hidden_states[batch_idx, seq_lens]
+    return hidden_states[batch_idx, last_idx]
 
 
 def _validate_extraction_position(
