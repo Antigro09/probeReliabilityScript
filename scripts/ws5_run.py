@@ -370,9 +370,18 @@ def main():
     ap.add_argument("--control-draws", type=int, default=20)
     ap.add_argument("--floor", type=float, default=DECODABILITY_FLOOR)
     ap.add_argument("--out-dir", default="results/ws5")
+    ap.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
+                    help="compute_hessian_spectrum does ~50 sequential double-backward "
+                         "steps per candidate on this D-dim synthetic batch; on Windows/WDDM "
+                         "the per-kernel-launch overhead of many tiny sequential CUDA ops can "
+                         "make this slower than plain CPU BLAS. 'auto' keeps the previous "
+                         "cuda-if-available behavior; pass cpu/cuda to compare wall time.")
     args = ap.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
     train_cfg = ProbeTrainConfig(epochs=50, lr=1e-3, weight_decay=0.01, batch_size=256)
     probe_cfg = {"hidden_dim": 256, "mka_lambda": 0.5, "knn_k": 10}
     alphas = [float(a) for a in args.alphas.split(",")]
@@ -382,13 +391,42 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     rows_path = out_dir / f"ws5_{args.family}.jsonl"
 
+    # Resume-safe by default: a (replicate, alpha) combo writes its rows only
+    # after run_replicate() returns, but a process can still die mid-write
+    # (observed: native crashes after 14+ hours of continuous GPU load, not
+    # tied to any specific input -- two isolated re-runs of crashed combos
+    # completed cleanly). Treat a combo as done only if it has exactly the
+    # expected row count; anything short gets recomputed from scratch rather
+    # than trusting a partial write.
+    expected_per_combo = len(ARCHS) * args.seeds + (2 * args.control_draws if args.controls else 0)
+    done: dict[tuple[int, float], list[dict]] = {}
+    if rows_path.exists():
+        by_combo: dict[tuple[int, float], list[dict]] = {}
+        with rows_path.open() as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                r = json.loads(line)
+                key = (r["replicate"], round(r["alpha_train"], 6))
+                by_combo.setdefault(key, []).append(r)
+        done = {k: v for k, v in by_combo.items() if len(v) == expected_per_combo}
+        skipped = len(by_combo) - len(done)
+        if done or skipped:
+            print(f"[resume] {rows_path}: {len(done)} complete combo(s) reusable, "
+                  f"{skipped} incomplete combo(s) will be recomputed")
+
     all_rows = []
     with rows_path.open("w") as f:
         for rep in range(args.replicates):
             for alpha in alphas:
-                print(f"[run] family={args.family} replicate={rep} alpha={alpha}")
-                rows, meta = run_replicate(args.family, alpha, rep, args, device,
-                                           train_cfg, probe_cfg, args.floor)
+                key = (rep, round(alpha, 6))
+                if key in done:
+                    print(f"[resume] family={args.family} replicate={rep} alpha={alpha} -- reusing {len(done[key])} rows")
+                    rows = done[key]
+                else:
+                    print(f"[run] family={args.family} replicate={rep} alpha={alpha}")
+                    rows, meta = run_replicate(args.family, alpha, rep, args, device,
+                                               train_cfg, probe_cfg, args.floor)
                 for r in rows:
                     f.write(json.dumps(r) + "\n")
                 all_rows.extend(rows)

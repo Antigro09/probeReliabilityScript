@@ -58,6 +58,13 @@ def parse_args():
     p.add_argument("--out-dir", default=None)
     p.add_argument("--cache-dir", default=None)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--max-attempts", type=int, default=5,
+                   help="a model-task cell that crashes (returncode not in {0,2}) is "
+                        "relaunched as a fresh subprocess up to this many times before "
+                        "being recorded as a genuine error; scripts.run_robustness_v3 "
+                        "resumes at (layer, architecture, seed) granularity so a retry "
+                        "continues rather than restarts. returncode==2 (learnability-gate "
+                        "exclusion) is a deterministic, expected outcome and is never retried.")
     return p.parse_args()
 
 
@@ -127,7 +134,16 @@ def main():
             cmd.append("--save-predictions")
 
         started = datetime.datetime.now(datetime.timezone.utc)
+        attempts = []
         returncode = _run(cmd, dry_run=args.dry_run)
+        attempts.append(returncode)
+        retry_budget = 1 if args.dry_run else args.max_attempts
+        while returncode not in (0, 2) and len(attempts) < retry_budget:
+            print(f"[{model['key']} x {task} x {position}] attempt {len(attempts)} "
+                  f"failed with rc={returncode}; relaunching fresh "
+                  f"(scripts.run_robustness_v3 resumes completed cells)")
+            returncode = _run(cmd, dry_run=args.dry_run)
+            attempts.append(returncode)
         ended = datetime.datetime.now(datetime.timezone.utc)
         status = "ok" if returncode == 0 else "excluded_by_gate" if returncode == 2 else "error"
         summary["runs"].append({
@@ -137,13 +153,14 @@ def main():
             "gated_model": model["gated"],
             "smoke": args.smoke,
             "returncode": returncode,
+            "attempts": attempts,
             "status": status,
             "started_utc": started.isoformat(timespec="seconds"),
             "ended_utc": ended.isoformat(timespec="seconds"),
         })
         if not args.dry_run:
             summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
-        print(f"[{model['key']} x {task} x {position}] -> {status} (rc={returncode})")
+        print(f"[{model['key']} x {task} x {position}] -> {status} (rc={returncode}, attempts={attempts})")
 
     if args.analyze:
         analysis_cmd = [

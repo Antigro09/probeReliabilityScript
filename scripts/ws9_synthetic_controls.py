@@ -39,8 +39,19 @@ def parse_args():
     p.add_argument("--D", type=int, default=256)
     p.add_argument("--N", type=int, default=8000)
     p.add_argument("--out-dir", default="results/robustness_v3/synthetic")
+    p.add_argument("--device", default="auto", choices=["auto", "cuda", "cpu"],
+                   help="passed through to scripts.ws5_run; see its --help for why "
+                        "cpu can outrun cuda on this tiny synthetic workload")
     p.add_argument("--smoke", action="store_true")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--max-attempts", type=int, default=5,
+                   help="a crashed condition is relaunched as a fresh subprocess up to "
+                        "this many times; scripts.ws5_run resumes from whatever combos "
+                        "already completed rather than starting over. Observed crashes "
+                        "were native aborts uncorrelated with input data (two isolated "
+                        "re-runs of crashed combos completed cleanly), consistent with "
+                        "GPU/driver state degrading under many hours of continuous load "
+                        "rather than a reproducible bug -- a fresh process reliably clears it.")
     return p.parse_args()
 
 
@@ -68,17 +79,28 @@ def main():
             "--control-draws", str(2 if args.smoke else args.control_draws),
             "--rlace-steps", str(20 if args.smoke else 200),
             "--out-dir", str(condition_dir),
+            "--device", args.device,
         ]
-        print("\n" + "#" * 78)
-        print("#", " ".join(cmd))
-        print("#" * 78)
-        returncode = 0 if args.dry_run else subprocess.run(cmd, cwd=str(PROJECT_ROOT)).returncode
+        attempts = []
+        returncode = 0
+        if not args.dry_run:
+            for attempt in range(1, args.max_attempts + 1):
+                print("\n" + "#" * 78)
+                print(f"# attempt {attempt}/{args.max_attempts}:", " ".join(cmd))
+                print("#" * 78)
+                returncode = subprocess.run(cmd, cwd=str(PROJECT_ROOT)).returncode
+                attempts.append(returncode)
+                if returncode == 0:
+                    break
+                print(f"[{name}] attempt {attempt} failed with rc={returncode}; "
+                      f"relaunching fresh (scripts.ws5_run resumes completed combos)")
         record = {
             "name": name,
             "family": family,
             "vs_vc_corr": corr,
             "rank": rank,
             "returncode": returncode,
+            "attempts": attempts,
             "status": "ok" if returncode == 0 else "error",
             "out_dir": str(condition_dir),
         }
@@ -90,7 +112,8 @@ def main():
             record["battery"] = json.loads(battery_path.read_text())
         summary["conditions"].append(record)
         if returncode != 0:
-            print(f"[{name}] failed with rc={returncode}; continuing to preserve other conditions")
+            print(f"[{name}] failed after {len(attempts)} attempt(s) (rcs={attempts}); "
+                  f"continuing to preserve other conditions")
 
     if not args.dry_run:
         (root / "synthetic_condition_summary.json").write_text(
