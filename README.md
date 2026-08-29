@@ -31,6 +31,52 @@ Accept licenses on:
 - https://huggingface.co/meta-llama/Llama-3.2-3B
 - https://huggingface.co/google/gemma-2-2b
 
+## Reviewer revision pipeline
+
+Run the locked reviewer experiment from the repository root with the checked-in
+Windows virtual environment. The required scientific protocol fits probes,
+applies edits, and computes statistics on CPU; accelerator use is limited to
+transformer representation extraction and the permitted candidate-MLP/Jacobian
+work. The reviewer runner consumes and preflight-validates existing caches;
+`--device auto` selects MPS for those accelerator-eligible operations on Apple
+Silicon and otherwise records a CPU fallback. It never moves the locked small
+scientific probes, edits, fresh decoders, or statistics off CPU.
+
+```powershell
+# First invocation: creates a new immutable timestamped run directory.
+.\.venv\Scripts\python.exe -m scripts.run_reviewer_revision all `
+  --config .\revision_experiment_spec.yaml `
+  --output-root .\results\reviewer_revision_2026_08 `
+  --device auto
+
+# Resume after an interruption: reopens the newest compatible unlocked run.
+.\.venv\Scripts\python.exe -m scripts.run_reviewer_revision all `
+  --config .\revision_experiment_spec.yaml `
+  --output-root .\results\reviewer_revision_2026_08 `
+  --device auto `
+  --resume
+```
+
+Each first invocation creates
+`results/reviewer_revision_2026_08/<UTC timestamp>-<commit>/`. Existing run
+directories and completed shards are never overwritten. `--resume` requires
+the same configuration hash and Git commit, validates completed artifacts and
+their hashes, and skips only gates that remain complete.
+
+The fail-closed gate order is: `preflight` -> `benchmark` ->
+`reproduce-baseline` -> `matched-split` -> `epsilon-sweep` ->
+`construct-check` -> `analyze` -> `figures` -> `patch-paper`. A failed gate
+stops all downstream work. The run directory contains the manifest and log,
+gate reports, CSV/Parquet row tables and summaries, analysis/macros/validation
+artifacts, PDF/PNG figures, and the compiled manuscript PDF specified by
+`revision_experiment_spec.yaml`.
+
+An `all` invocation intentionally finishes with
+`pending_visual_inspection`, even when it exits successfully. The handoff is
+complete only after every rendered manuscript page and generated figure has
+been visually inspected and that review is recorded as `visually_inspected`;
+an exit code or source-level test result alone is not the completion gate.
+
 ### Data
 
 - SVA: place numpred.{train,val,test} in data/.

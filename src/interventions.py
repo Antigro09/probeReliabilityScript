@@ -21,8 +21,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from .probes import LinearProbe
 
@@ -34,9 +34,75 @@ def _binary_linear_direction(probe: LinearProbe) -> torch.Tensor:
     return direction / (direction.norm() + 1e-9)
 
 
+def _apply_orthogonal_erasure(
+    X: torch.Tensor,
+    basis: torch.Tensor,
+) -> torch.Tensor:
+    """Apply ``I - Q Q^T`` without materializing the square projector.
+
+    ``basis`` must contain orthonormal columns.  The low-rank expression uses
+    ``O(NDr)`` work and ``O(Nr)`` temporary storage instead of the ``O(ND^2)``
+    dense multiplication required by ``X @ (I - Q @ Q.T)``.
+    """
+
+    if X.ndim != 2:
+        raise ValueError("X must be a two-dimensional tensor")
+    if basis.ndim != 2:
+        raise ValueError("basis must be a two-dimensional tensor")
+    if X.shape[1] != basis.shape[0]:
+        raise ValueError("basis dimension does not match X")
+    return (X - (X @ basis) @ basis.T).contiguous()
+
+
 # ---------------------------------------------------------------------------
 # INLP
 # ---------------------------------------------------------------------------
+
+def _fit_inlp_subspace(
+    X: torch.Tensor,
+    y: torch.Tensor,
+    device: torch.device,
+    num_iters: int = 10,
+    epochs: int = 100,
+    lr: float = 0.1,
+    early_stop_acc: float = 0.55,
+) -> torch.Tensor:
+    """Fit and return an orthonormal basis for the INLP row space."""
+
+    d = X.shape[1]
+    Xc = X.detach().cpu().clone().float()
+    basis = torch.empty((d, 0), dtype=Xc.dtype)
+    for _ in range(num_iters):
+        clf = LinearProbe(d).to(device)
+        opt = torch.optim.SGD(clf.parameters(), lr=lr)
+        Xd = Xc.to(device)
+        yd = y.to(device)
+        for _ in range(epochs):
+            logits = clf(Xd)
+            loss = F.cross_entropy(logits, yd)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        with torch.no_grad():
+            preds = clf(Xd).argmax(dim=-1)
+            acc = (preds == yd).float().mean().item()
+        if acc < early_stop_acc:
+            break
+
+        # A two-logit softmax depends on (w[1] - w[0])^T x.  Remove any
+        # component already represented in the accumulated row space so that
+        # the returned basis defines a genuine orthogonal projector.
+        direction = _binary_linear_direction(clf).cpu().float()
+        if basis.shape[1]:
+            direction = direction - basis @ (basis.T @ direction)
+        direction_norm = direction.norm()
+        if not torch.isfinite(direction_norm) or float(direction_norm) <= 1.0e-8:
+            break
+        new_direction = (direction / direction_norm).unsqueeze(1)
+        basis = torch.cat((basis, new_direction), dim=1)
+        Xc = _apply_orthogonal_erasure(Xc, new_direction)
+    return basis
+
 
 def inlp_projection(
     X: torch.Tensor,
@@ -54,45 +120,95 @@ def inlp_projection(
     Returns:
         P: (D, D) tensor on CPU. To intervene: X_post = X @ P.
     """
+    basis = _fit_inlp_subspace(
+        X,
+        y,
+        device=device,
+        num_iters=num_iters,
+        epochs=epochs,
+        lr=lr,
+        early_stop_acc=early_stop_acc,
+    )
     d = X.shape[1]
-    Xc = X.detach().clone().float()
-    P = torch.eye(d)
-    for _ in range(num_iters):
-        clf = LinearProbe(d).to(device)
-        opt = torch.optim.SGD(clf.parameters(), lr=lr)
-        Xd = Xc.to(device)
-        yd = y.to(device)
-        for _ in range(epochs):
-            logits = clf(Xd)
-            loss = F.cross_entropy(logits, yd)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-        with torch.no_grad():
-            preds = clf(Xd).argmax(dim=-1)
-            acc = (preds == yd).float().mean().item()
-        if acc < early_stop_acc:
-            break
-        # Project out the binary discriminant. A two-logit softmax depends on
-        # (w[1] - w[0])^T x; using w[0] alone is parameterization-dependent and
-        # need not remove the decision direction.
-        v = _binary_linear_direction(clf).cpu().unsqueeze(0)
-        P_step = torch.eye(d) - v.T @ v
-        P = P @ P_step
-        Xc = Xc @ P_step
-    return P
+    return torch.eye(d, dtype=basis.dtype) - basis @ basis.T
 
 
 def apply_inlp(X: torch.Tensor, zc: torch.Tensor, *,
                device: torch.device, num_iters: int = 10) -> torch.Tensor:
-    """Convenience wrapper: compute P from (X, zc) and return X @ P."""
-    P = inlp_projection(X, zc, device=device, num_iters=num_iters)
-    return X @ P
+    """Fit INLP and apply its low-rank erasure without constructing ``P``."""
+    basis = _fit_inlp_subspace(X, zc, device=device, num_iters=num_iters)
+    Xd = X.detach().cpu().float()
+    return _apply_orthogonal_erasure(Xd, basis)
 
 
 # ---------------------------------------------------------------------------
 # RLACE (rank-r adversarial erasure)
 # ---------------------------------------------------------------------------
+
+def _fit_rlace_subspace(
+    X: torch.Tensor,
+    y: torch.Tensor,
+    device: torch.device,
+    rank: int = 1,
+    steps: int = 500,
+    lr: float = 1e-2,
+    inner_steps: int = 5,
+) -> torch.Tensor:
+    """Fit the approximate-RLACE adversarial subspace on ``device``."""
+
+    d = X.shape[1]
+    if rank < 1 or rank > d:
+        raise ValueError(f"rank must be between 1 and {d}, got {rank}")
+
+    # U remains the optimizer leaf.  QR is differentiable in the outer step,
+    # while the inner classifier step intentionally treats the current
+    # projection as fixed.
+    U = (torch.randn(d, rank, device=device) * 0.01).requires_grad_(True)
+    clf = nn.Linear(d, 2).to(device)
+    opt_u = torch.optim.Adam([U], lr=lr)
+    opt_c = torch.optim.Adam(clf.parameters(), lr=lr)
+
+    Xd = X.to(device).float()
+    yd = y.to(device)
+
+    for _ in range(steps):
+        for _ in range(inner_steps):
+            with torch.no_grad():
+                fixed_basis = torch.linalg.qr(U, mode="reduced")[0]
+            projected = _apply_orthogonal_erasure(Xd, fixed_basis)
+            logits = clf(projected.detach())
+            loss_c = F.cross_entropy(logits, yd)
+            opt_c.zero_grad(set_to_none=True)
+            loss_c.backward()
+            opt_c.step()
+
+        # Keep QR in the autograd graph: this is the only path from the outer
+        # adversarial loss back to U.  Detaching the classifier weights avoids
+        # accumulating irrelevant classifier gradients while retaining the
+        # derivative through its input.
+        basis = torch.linalg.qr(U, mode="reduced")[0]
+        projected = _apply_orthogonal_erasure(Xd, basis)
+        logits = F.linear(projected, clf.weight.detach(), clf.bias.detach())
+        loss_u = -F.cross_entropy(logits, yd)
+        opt_u.zero_grad(set_to_none=True)
+        loss_u.backward()
+        if U.grad is None:
+            raise RuntimeError("RLACE adversarial subspace received no gradient")
+        if not torch.isfinite(U.grad).all():
+            raise FloatingPointError("RLACE adversarial subspace gradient is non-finite")
+        opt_u.step()
+
+        # A well-conditioned full-rank representative makes the next QR and
+        # its derivative stable without changing the represented subspace.
+        with torch.no_grad():
+            U.copy_(torch.linalg.qr(U, mode="reduced")[0])
+
+    with torch.no_grad():
+        basis = torch.linalg.qr(U, mode="reduced")[0]
+    if not torch.isfinite(basis).all():
+        raise FloatingPointError("RLACE produced a non-finite subspace")
+    return basis
+
 
 def rlace_projection(
     X: torch.Tensor,
@@ -112,53 +228,31 @@ def rlace_projection(
     purposes. Returns the projection matrix P = I - U U^T where U is the
     rank-r adversarial subspace.
     """
+    basis = _fit_rlace_subspace(
+        X,
+        y,
+        device=device,
+        rank=rank,
+        steps=steps,
+        lr=lr,
+        inner_steps=inner_steps,
+    )
     d = X.shape[1]
-    # Adversarial subspace U: D x rank, orthonormalized each step.
-    # NOTE: must call requires_grad_() on a leaf tensor; multiplying first
-    # would create a non-leaf which Adam can't optimize.
-    U = (torch.randn(d, rank, device=device) * 0.01).requires_grad_(True)
-    clf = nn.Linear(d, 2).to(device)
-
-    opt_u = torch.optim.Adam([U], lr=lr)
-    opt_c = torch.optim.Adam(clf.parameters(), lr=lr)
-
-    Xd = X.to(device).float()
-    yd = y.to(device)
-
-    for _ in range(steps):
-        # Inner loop: train classifier on projected X
-        for _ in range(inner_steps):
-            with torch.no_grad():
-                Q, _ = torch.linalg.qr(U)  # orthonormalize
-            P = torch.eye(d, device=device) - Q @ Q.T
-            Xp = Xd @ P
-            logits = clf(Xp.detach())
-            loss_c = F.cross_entropy(logits, yd)
-            opt_c.zero_grad()
-            loss_c.backward()
-            opt_c.step()
-        # Outer step: U tries to make classifier WORSE
-        with torch.no_grad():
-            Q, _ = torch.linalg.qr(U)
-        P = torch.eye(d, device=device) - Q @ Q.T
-        Xp = Xd @ P
-        logits = clf(Xp)
-        loss_u = -F.cross_entropy(logits, yd)
-        opt_u.zero_grad()
-        loss_u.backward()
-        opt_u.step()
-
     with torch.no_grad():
-        Q, _ = torch.linalg.qr(U)
-        P = torch.eye(d, device=device) - Q @ Q.T
-    return P.cpu()
+        projection = (
+            torch.eye(d, device=device, dtype=basis.dtype) - basis @ basis.T
+        )
+    return projection.cpu()
 
 
 def apply_rlace(X: torch.Tensor, zc: torch.Tensor, *,
                 device: torch.device, rank: int = 1,
                 steps: int = 500) -> torch.Tensor:
-    P = rlace_projection(X, zc, device=device, rank=rank, steps=steps)
-    return X @ P
+    basis = _fit_rlace_subspace(
+        X, zc, device=device, rank=rank, steps=steps
+    )
+    Xd = X.to(device).float()
+    return _apply_orthogonal_erasure(Xd, basis).cpu()
 
 
 # ---------------------------------------------------------------------------

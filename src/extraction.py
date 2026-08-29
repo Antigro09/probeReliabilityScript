@@ -22,9 +22,9 @@ Practical notes:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -32,7 +32,6 @@ from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 from .data import LinzenExample  # for backward compatibility
-
 
 # Protocol-style type alias: anything with .sentence, .zc, .ze works.
 # Both LinzenExample and tasks.Example satisfy this.
@@ -184,6 +183,17 @@ def select_layers(n_layers: int, k: int = 5) -> list[int]:
 
 # Extraction -----------------------------------------------------------------
 
+def _last_attended_indices(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Return the final index whose attention mask is one for each row."""
+    if attention_mask.ndim != 2:
+        raise ValueError(
+            f"attention_mask must be rank two, got shape {tuple(attention_mask.shape)}"
+        )
+    if torch.any(attention_mask.to(torch.bool).sum(dim=1) == 0):
+        raise ValueError("attention_mask contains a row with no attended tokens")
+    seq_len = attention_mask.shape[1]
+    return seq_len - 1 - attention_mask.to(torch.bool).flip(dims=[1]).long().argmax(dim=1)
+
 @torch.no_grad()
 def _last_token_hidden(hidden_states: torch.Tensor,
                        attention_mask: torch.Tensor) -> torch.Tensor:
@@ -200,9 +210,7 @@ def _last_token_hidden(hidden_states: torch.Tensor,
     right-padded models this formula is identical to sum()-1, so it is a no-op
     for BERT/GPT-2/Pythia/Qwen/LLaMA.
     """
-    seq_len = attention_mask.shape[1]
-    # position of the last 1 = T-1 minus the offset of the first 1 from the right
-    last_idx = seq_len - 1 - attention_mask.flip(dims=[1]).long().argmax(dim=1)
+    last_idx = _last_attended_indices(attention_mask)
     batch_idx = torch.arange(hidden_states.shape[0], device=hidden_states.device)
     return hidden_states[batch_idx, last_idx]
 
@@ -234,7 +242,7 @@ def _validate_extraction_position(
     )
     input_ids = encoded["input_ids"]
     attention_mask = encoded["attention_mask"]
-    last_pos = attention_mask.sum(dim=1) - 1
+    last_pos = _last_attended_indices(attention_mask)
     last_ids = input_ids[torch.arange(len(input_ids)), last_pos]
     last_strs = [tokenizer.decode([tid]).strip() for tid in last_ids.tolist()]
 
@@ -251,15 +259,18 @@ def _validate_extraction_position(
     info = {
         "model": bundle.name,
         "n_samples_checked": len(sample_sentences),
+        "last_token_positions": last_pos.tolist(),
+        "last_token_ids": last_ids.tolist(),
         "last_token_strings": last_strs[:5],
         "special_token_at_end": bad,
         "tokenizer_class": type(tokenizer).__name__,
     }
 
     if bad:
+        trailing_special_tokens = {item[1] for item in bad}
         raise RuntimeError(
             f"[{bundle.name}] Tokenizer is appending special tokens "
-            f"({set(b[1] for b in bad)}) to the end of inputs. The last-token "
+            f"({trailing_special_tokens}) to the end of inputs. The last-token "
             f"extraction position would point to a special token, not the "
             f"prefix's final word. Set add_special_tokens=False or strip them."
             f"\nFirst-5 last tokens decoded: {last_strs[:5]}"
@@ -289,7 +300,7 @@ def extract_layers_multi(
 
     Returns dict: layer_idx -> (X, zc, ze), each on CPU / float32.
     """
-    layer_idxs = sorted(set(int(l) for l in layer_idxs))
+    layer_idxs = sorted({int(layer) for layer in layer_idxs})
     for layer_idx in layer_idxs:
         if not (0 <= layer_idx <= bundle.n_layers):
             raise ValueError(
@@ -383,10 +394,10 @@ def extract_all_layers(
     dataset hash is also part of the filename, so caches can never collide
     across splits or data versions.
     """
-    from .repro import hash_examples, write_provenance, read_provenance
+    from .repro import hash_examples, read_provenance, write_provenance
 
     out: dict[int, dict] = {}
-    layers = sorted(set(int(l) for l in layers))
+    layers = sorted({int(layer) for layer in layers})
 
     # Validate position once for this model, not per layer
     sample = [ex.sentence for ex in examples[:8]]
@@ -432,8 +443,18 @@ def extract_all_layers(
                     "n_examples": len(examples),
                     "hidden_size": bundle.hidden_size,
                     "n_layers": bundle.n_layers,
-                    "dtype": str(bundle.dtype),
+                    # `dtype` historically meant model-forward dtype even
+                    # though persisted representations are always float32.
+                    # Schema v2 makes the on-disk tensor dtype explicit and
+                    # records the forward dtype separately.
+                    "dtype": str(out[layer_idx]["X"].dtype),
+                    "representation_dtype": str(out[layer_idx]["X"].dtype),
+                    "model_forward_dtype": str(bundle.dtype),
                     "extraction_rule": "last non-padding input token",
+                    "extraction_code_version": "last-nonpadding-mask-index-v2",
+                    "tokenizer_padding_side": getattr(
+                        bundle.tokenizer, "padding_side", None
+                    ),
                     "add_special_tokens": False,
                     "data_hash": data_hash,
                     "max_length": max_length,
