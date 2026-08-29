@@ -369,7 +369,9 @@ def _package_version(name: str) -> str | None:
 
 def _environment_report(device: torch.device) -> dict[str, Any]:
     memory = psutil.virtual_memory()
-    disk = psutil.disk_usage(PROJECT_ROOT)
+    # psutil's Windows extension does not accept pathlib.Path even though the
+    # POSIX implementation does.  Normalize at the cross-platform boundary.
+    disk = psutil.disk_usage(str(PROJECT_ROOT))
     requirements_path = PROJECT_ROOT / "requirements.txt"
     installed_distributions = sorted(
         (

@@ -20,6 +20,7 @@ from src.reviewer_revision.experiments import (
 from src.reviewer_revision.runner import (
     _augment_matched_artifacts,
     _construct_row_base,
+    _environment_report,
     _failure_rows,
     _main_text_page_count_from_text,
     _materialize_shards,
@@ -446,6 +447,25 @@ def test_runtime_projection_counts_every_epsilon_attack_and_reference_control():
     assert projection["required_middle_epsilon_seconds"] == pytest.approx(
         60 * (10 * (1.0 + 0.5 + 2.0 + 0.5) + 20 * 1.0)
     )
+
+
+def test_environment_report_normalizes_project_path_for_psutil(monkeypatch):
+    from src.reviewer_revision import runner
+
+    observed: list[str] = []
+    real_disk_usage = runner.psutil.disk_usage
+
+    def strict_disk_usage(path):
+        assert isinstance(path, str)
+        observed.append(path)
+        return real_disk_usage(path)
+
+    monkeypatch.setattr(runner.psutil, "disk_usage", strict_disk_usage)
+    report = _environment_report(torch.device("cpu"))
+
+    assert observed
+    assert report["selected_device"] == "cpu"
+    assert report["disk_free_bytes"] > 0
 
 
 def test_disk_projection_exposes_exact_per_cell_accounting():
