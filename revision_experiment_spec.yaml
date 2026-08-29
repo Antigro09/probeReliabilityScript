@@ -1,0 +1,326 @@
+schema_version: 1
+run_name: reviewer_revision_2026_08
+purpose: >-
+  Expand the matched-versus-split evaluator control, resolve FGSM/PGD ceiling
+  ambiguity with an epsilon sweep, and run orientation plus post-edit
+  redecodability checks on a prespecified real-data cell.
+
+reproducibility:
+  master_seed: 20260829
+  pair_seeds: [0, 1, 2, 3, 4]
+  bootstrap_seed: 20260830
+  bootstrap_draws: 10000
+  permutation_seed: 20260831
+  float_dtype_for_probe_training: float32
+  deterministic_algorithms: true
+  preserve_existing_artifacts: true
+  overwrite: false
+
+runtime:
+  device_priority: [mps, cpu]
+  transformer_extraction_device: mps
+  linear_probe_device: cpu
+  statistics_device: cpu
+  env:
+    PYTORCH_ENABLE_MPS_FALLBACK: "1"
+    TOKENIZERS_PARALLELISM: "false"
+  full_grid_max_projected_hours: 48
+  epsilon_all_layers_max_projected_hours: 12
+  maximum_projected_disk_gb: 80
+
+models:
+  - key: pythia
+    hf_id: EleutherAI/pythia-160m
+    layers: [1, 4, 6, 9, 12]
+    middle_layer: 6
+  - key: gpt2
+    hf_id: openai-community/gpt2
+    layers: [1, 4, 6, 9, 12]
+    middle_layer: 6
+  - key: bert
+    hf_id: google-bert/bert-base-uncased
+    layers: [1, 4, 6, 9, 12]
+    middle_layer: 6
+  - key: qwen
+    hf_id: Qwen/Qwen2.5-1.5B
+    layers: [1, 8, 14, 21, 28]
+    middle_layer: 14
+  - key: gemma
+    hf_id: google/gemma-2-2b
+    layers: [1, 7, 14, 20, 26]
+    middle_layer: 14
+  - key: llama
+    hf_id: meta-llama/Llama-3.2-3B
+    layers: [1, 8, 14, 21, 28]
+    middle_layer: 14
+
+tasks:
+  required: [sva, sst2]
+  excluded: [gender]
+  exclusion_reason: >-
+    WinoGender is not part of the reviewer-requested expansion; the archived
+    version was underpowered and the original Phase-1 preprocessing was broken.
+
+shared_score_definition:
+  chance: 0.5
+  denominator_floor: 0.55
+  target_damage: clip((target_acc_pre - target_acc_post) / (target_acc_pre - 0.5), 0, 1)
+  control_preservation: clip((control_acc_post - 0.5) / (control_acc_pre - 0.5), 0, 1)
+  harmonic_mean: 2 * C * S / (C + S), with H(0,0)=0
+
+baseline_interventions:
+  alterrep:
+    alpha: 1.0
+  fgsm:
+    norm: linf
+    epsilon: 0.5
+  pgd:
+    norm: linf
+    epsilon: 0.5
+    steps: 10
+    step_size: 0.1
+    step_size_rule_for_sweep: epsilon / 5
+
+experiment_a_expanded_matched_split:
+  primary_method: alterrep
+  secondary_methods: [fgsm, pgd]
+  reference_controls: [inlp, rlace]
+  scoring_conditions: [matched, split]
+  full_grid:
+    models: all
+    tasks: [sva, sst2]
+    layer_policy: all_five_sampled_layers
+    expected_cells: 60
+    expected_model_task_blocks: 12
+    expected_pair_units: 300
+  fallback_grid:
+    trigger: projected_full_grid_hours_above_runtime_limit
+    models: all
+    tasks: [sva, sst2]
+    layer_policy: first_middle_last
+    expected_cells: 36
+    expected_model_task_blocks: 12
+    expected_pair_units: 180
+  hard_floor:
+    minimum_total_cells: 36
+    rule: do_not_reduce_below_this_without_a_structured_fatal_blocker
+  estimand: >-
+    For each model-layer-task-pair, Delta = C_matched - C_split for the exact
+    same attacker-generated edited representations. Average pair deltas within
+    cell, then average cells with equal weight.
+  inference:
+    primary_cluster: model_task
+    primary_exact_test: two_sided_sign_flip_over_12_model_task_block_means
+    primary_interval: hierarchical_percentile_bootstrap
+    bootstrap_hierarchy: [model_task_block, layer_within_block, pair_within_cell]
+    secondary_test: two_sided_sign_flip_over_model_layer_task_cell_means
+    secondary_label: sensitivity_only_layers_share_examples
+    report:
+      - grand_mean_matched
+      - grand_mean_split
+      - grand_mean_gap
+      - median_gap
+      - fraction_cell_gaps_positive
+      - fraction_block_gaps_positive
+      - depth_position_means
+      - task_specific_means
+      - leave_one_model_out_means
+      - all_zero_and_nonzero_counts
+
+experiment_b_epsilon_sweep:
+  methods: [fgsm, pgd]
+  scoring_conditions: [matched, split]
+  required_scope:
+    models: all
+    tasks: [sva, sst2]
+    layers: middle_only
+    expected_cells: 12
+  automatic_extension:
+    condition: projected_all_layer_sweep_hours_at_or_below_runtime_limit
+    scope: use_experiment_a_selected_cells
+  epsilons:
+    - 0.0
+    - 0.001953125
+    - 0.00390625
+    - 0.0078125
+    - 0.015625
+    - 0.03125
+    - 0.0625
+    - 0.125
+    - 0.25
+    - 0.5
+  pgd:
+    steps: 10
+    step_size_rule: epsilon / 5
+    preserve_random_start_behavior_from_baseline_implementation: true
+  paired_randomness:
+    reuse_attacker_evaluator_weights_across_epsilons: true
+    reuse_example_order_across_epsilons: true
+    reuse_pgd_random_start_base_noise_across_epsilons: true
+  integrity:
+    epsilon_zero_is_exact_noop: true
+    epsilon_zero_max_abs_representation_delta_tolerance: 1.0e-6
+    epsilon_zero_target_damage_tolerance: 1.0e-6
+    enforce_linf_bound: true
+    baseline_epsilon_must_reproduce_archived_pattern: true
+  report:
+    - raw_target_accuracy_pre_and_post
+    - raw_control_accuracy_pre_and_post
+    - C
+    - S
+    - H
+    - orientation_sensitivity_accuracy
+    - auc
+    - log_loss
+    - ceiling_indicator
+    - realized_linf_norm
+  figure:
+    x_axis: epsilon_log2_with_zero_shown_separately
+    y_axis: mean_target_damage_C
+    panels: [fgsm, pgd]
+    lines: [matched, split]
+    uncertainty: model_task_cluster_bootstrap_95_percent
+    companion_panel_or_table: fraction_at_C_equal_1_by_epsilon
+
+experiment_c_orientation_redecodability:
+  cell:
+    model_key: qwen
+    model_id: Qwen/Qwen2.5-1.5B
+    task: sst2
+    layer: 14
+    selection_rule: >-
+      Largest archived AlterRep matched-minus-split gap among non-Gemma,
+      high-sample SST-2 middle-layer cells; selected before the new run.
+  candidate_scope:
+    architectures: [linear, mlp, mka]
+    seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    expected_candidates: 60
+  edit_objects:
+    required: [alterrep, dcand_crossfit]
+    epsilon_methods_for_orientation_only: [fgsm, pgd]
+  source_split:
+    preserve_phase2_candidate_fraction: 0.40
+    preserve_phase2_evaluator_fraction: 0.20
+    subdivide_phase2_intervention_fraction:
+      direction_fit: one_third
+      fresh_decoder_fit: one_third
+      orientation_calibration: one_sixth
+      final_test: one_sixth
+    preserve_phase2_test_fraction_unused_for_this_check: 0.10
+    grouping_unit: sentence_id_or_existing_dedup_group
+    stratify_by: joint_target_control_label
+  direction_estimation:
+    dcand_crossfit_uses_only_direction_fit: true
+    scoring_never_uses_direction_fit_examples: true
+    normalize_direction_l2: true
+  fixed_evaluator_metrics:
+    raw:
+      - accuracy
+      - balanced_accuracy
+      - confusion_matrix
+      - auc
+      - log_loss
+    orientation:
+      choose_identity_or_flip_on: orientation_calibration
+      apply_choice_to: final_test
+      report:
+        - calibrated_orientation_accuracy
+        - max_accuracy_sensitivity
+        - orientation_adjusted_auc
+        - orientation_adjusted_log_loss
+        - C_raw
+        - C_orientation_calibrated
+  fresh_decoders:
+    train_on: edited_fresh_decoder_fit
+    evaluate_on: edited_final_test
+    tune_only_within: fresh_decoder_fit
+    hyperparameter_selection: >-
+      Select once on unedited fresh_decoder_fit data for each decoder family and
+      label using an inner group-disjoint validation split; freeze and reuse the
+      selected settings for every edit.
+    target_and_control: true
+    unedited_baseline: true
+    required_models:
+      linear:
+        implementation: reuse_repository_linear_probe
+        learning_rates: [0.0003, 0.001, 0.003]
+        weight_decays: [0.0, 0.001, 0.01, 0.1]
+        epochs: 50
+        batch_size: 256
+        early_stopping_patience: 5
+      mlp:
+        implementation: reuse_repository_mlp_probe
+        hidden_dim: 256
+        learning_rate: 0.001
+        weight_decay: 0.01
+        epochs: 50
+        batch_size: 256
+        early_stopping_patience: 5
+        seeds: [0, 1, 2]
+    derived_quantities:
+      target_recovery_ratio: (post_edit_acc - 0.5) / (unedited_acc - 0.5)
+      control_retention_ratio: (post_edit_control_acc - 0.5) / (unedited_control_acc - 0.5)
+  save:
+    - split_manifest_with_example_ids_and_hashes
+    - candidate_checkpoint_hashes
+    - evaluator_checkpoint_hashes
+    - direction_vectors
+    - per_example_pre_and_post_logits
+    - per_example_predictions
+    - raw_and_orientation_adjusted_confusion_matrices
+    - edited_representation_shards_or_lossless_reconstruction_recipe
+    - fresh_decoder_checkpoints
+    - hyperparameter_selection_records
+  interpretation_rules:
+    inversion: raw_post_accuracy_below_0_5_but_calibrated_orientation_accuracy_high
+    redecodable: fresh_decoder_post_accuracy_materially_above_0_5
+    limitation: absence_of_recovery_in_one_cell_is_not_proof_of_erasure
+
+outputs:
+  root: results/reviewer_revision_2026_08
+  immutable_run_directory: true
+  required_files:
+    - run_manifest.json
+    - environment.json
+    - preflight_report.json
+    - runtime_benchmark.json
+    - matched_split_rows.parquet
+    - matched_split_rows.csv
+    - matched_split_summary.json
+    - epsilon_sweep_rows.parquet
+    - epsilon_sweep_rows.csv
+    - epsilon_sweep_summary.json
+    - construct_check_rows.parquet
+    - construct_check_rows.csv
+    - construct_check_summary.json
+    - analysis_summary.json
+    - manuscript_numbers.tex
+    - validation_report.md
+    - console.log
+  figures:
+    directory: figures
+    formats: [pdf, png]
+    png_dpi: 300
+    names:
+      expanded_matched_split: fig_circularity_expanded
+      epsilon_sweep: fig_epsilon_sweep
+      construct_check: fig_orientation_redecodability
+
+paper_update:
+  source: main_revised.tex
+  bibliography: references.bib
+  update_numbers_from: results/reviewer_revision_2026_08/manuscript_numbers.tex
+  required_markers:
+    - BEGIN POST-RUN EPSILON-SWEEP UPDATE
+    - BEGIN POST-RUN ORIENTATION-REDECODABILITY UPDATE
+  terminology:
+    preferred_condition_names: [matched, split]
+    never_equate_fixed_decoder_damage_with_erasure: true
+    distinguish_cells_from_independent_model_task_blocks: true
+  compile:
+    engine: latexmk_pdf
+    fail_on_undefined_references: true
+    fail_on_missing_citations: true
+    fail_on_overfull_hbox_over_3pt: true
+    render_and_visually_inspect: true
+

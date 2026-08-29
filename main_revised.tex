@@ -1,0 +1,265 @@
+\documentclass{article}
+
+\usepackage[dblblindworkshop]{neurips_2026}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{hyperref}
+\usepackage{url}
+\urlstyle{same}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{microtype}
+\usepackage{xcolor}
+\renewcommand{\ttdefault}{pcr}
+
+\newtheorem{proposition}{Proposition}
+\newcommand{\zc}{Z_c}
+\newcommand{\ze}{Z_e}
+\newcommand{\Dcand}{D_{\mathrm{cand}}}
+\newcommand{\RPmax}{R_{\mathrm{P1\text{-}max}}}
+
+% Central empirical results. The post-run agent should update these commands
+% from generated result artifacts rather than editing numeric claims in prose.
+\newcommand{\SplitCells}{12}
+\newcommand{\SplitMatched}{0.983}
+\newcommand{\SplitIndependent}{0.640}
+\newcommand{\SplitGap}{0.343}
+\newcommand{\SplitCI}{$[0.164,0.527]$}
+\newcommand{\SplitP}{.0156}
+\newcommand{\BugFilteredN}{2{,}000}
+\newcommand{\BugFilteredMedian}{0.998}
+\newcommand{\BugFilteredCeiling}{26\%}
+\newcommand{\BugFilteredAlterRep}{72\%}
+
+\title{Evaluator Reuse Inflates Intervention Scores: A Validity Audit of Probe-Ranking Targets}
+\workshoptitle{Interpretability for Discovery}
+\author{Anonymous Authors}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Intervention-based probe rankings can treat damage to a downstream decoder as evidence that a candidate probe has identified a causally important direction. That interpretation is not identified when the decoder also supplies the edit direction, or when the score does not depend on the candidate. We audit a multi-model NLP pipeline with both defects. In a registered matched-versus-split control over \SplitCells{} model--task cells, AlterRep target damage falls from \SplitMatched{} when the generating decoder scores its own edit to \SplitIndependent{} under a separately trained evaluator (gap \SplitGap{}, 95\% cell-bootstrap interval \SplitCI{}; exact sign-flip $p=\SplitP$). The design-level diagnosis survives three known implementation errors: after excluding every affected record, \BugFilteredN{} records remain, the original cell score has median \BugFilteredMedian{}, \BugFilteredCeiling{} are exactly $1.0$, and AlterRep is the first maximizer in \BugFilteredAlterRep{}. We use these failures to formulate a five-part scored-object validity protocol covering candidate identity, evaluator separation, construct checks, data separation, and clustered inference. A candidate-conditioned replacement recovers planted rankings but fails a preregistered nonlinear saturation test, so we report it only as a diagnostic. Fixed-decoder damage is not, by itself, evidence of concept erasure or probe reliability.
+\end{abstract}
+
+\section{Introduction}
+
+A probe-ranking target is useful only if it measures the candidate being ranked. This condition is easy to violate in causal probing. A researcher trains a probe, edits a hidden representation, and measures damage to a downstream decoder. The resulting number may describe the edit, the decoder, or the representation. It need not describe the candidate probe.
+
+Our central control isolates one such failure mode. AlterRep uses a decoder-derived direction to edit a representation. When the same decoder also scores that edit, mean target damage is \SplitMatched{}. Replacing it with a separately trained split evaluator reduces mean damage to \SplitIndependent{}, a gap of \SplitGap{} across \SplitCells{} model--task cells. The 95\% cell-bootstrap interval is \SplitCI{}, and an exact two-sided sign-flip test gives $p=\SplitP$. The edit is unchanged; only the scoring decoder changes.
+
+The case study also contained three implementation defects: a padding error collapsed Gemma states, WinoGender preprocessing removed the disambiguating pronoun, and a no-gradient kernel duplicated the ordinary and regularized MLPs. We remove every affected Phase-1 row before the robustness analysis. The remaining \BugFilteredN{} records still have a median cell target of \BugFilteredMedian{}; \BugFilteredCeiling{} are exactly $1.0$, and AlterRep is the first maximizer in \BugFilteredAlterRep{} of cases.
+
+The audited benchmark was an internal, previously unpublished adaptation of the completeness and selectivity criteria in \citet{canby2025reliable}. It generated five cell-level edits, reused fixed evaluator probes to generate three of them, took the maximum score over methods, and copied that value to every candidate in a model--layer--task cell. \citet{canby2025reliable}, by contrast, evaluate interventions and train approximate oracle probes on data disjoint from interventional probes. We audit our adaptation, not their intervention-level framework, and make no prevalence claim about published systems.
+
+The paper's main contribution is the falsifiable protocol in Table~\ref{tab:protocol}. It asks whether candidate information reaches the target, whether edit generation is separated from scoring, whether inversion or redecoding can explain apparent damage, whether direction fitting and scoring share examples, and whether inference respects shared data. Proposition~\ref{prop:constant} records the bookkeeping consequence of copying one cell score across candidates; the protocol, not that observation, is the general result. A candidate-conditioned replacement passes rank-recovery checks in synthetic data but fails its locked nonlinear saturation criterion. We therefore keep the replacement as a diagnostic rather than relabeling it as a reliability or erasure score.
+
+\paragraph{Relation to prior work.}
+Linear probes expose decodable information but do not show that a model uses it \citep{alain2017understanding,hewitt2019designing,belinkov2022probing}. Representation edits add causal evidence under stronger assumptions: INLP removes linearly decodable directions \citep{ravfogel2020null}, RLACE learns an adversarial linear projection \citep{ravfogel2022linear}, and amnesic probing measures behavioral effects after removal \citep{elazar2021amnesic}. Probe-derived directions may mix concept and non-concept features \citep{kumar2022unreliable}; LEACE instead guarantees linear guardedness under a minimum-distortion criterion \citep{belrose2023leace}. Our fixed-evaluator score provides neither guarantee. We ask the prior measurement question: what object does the score identify?
+
+The failed motivating hypothesis also crossed geometric levels. Results on leading Hessian eigenspaces concern optimization and decision-boundary geometry \citep{gurari2018gradient,sabanayagam2023unveiling,fernandez2025connecting}. We had treated their relationship with probe parameters as a possible predictor of intervention quality. Once the target fails scored-object validity, its correlation cannot establish a link between Hessian geometry and representation-level causal structure.
+
+\section{Evaluator reuse changes measured damage}
+\label{sec:split}
+
+The matched-versus-split control holds the edit fixed and changes only the evaluator. For each of six models, we use the middle layer on SVA and SST-2. Five independently seeded attacker/evaluator pairs train on sentence-disjoint examples. The attacker generates each edit. The edited representations are then scored either by that attacker (matched) or by its paired evaluator (split). We average the five pair-level contrasts within each model--task cell and conduct inference over the \SplitCells{} cell means.
+
+AlterRep's mean target damage drops from \SplitMatched{} to \SplitIndependent{}. The mean paired gap is \SplitGap{}, with a 95\% cell-bootstrap interval of \SplitCI{} and exact two-sided sign-flip $p=\SplitP$. All seven nonzero cell gaps are positive; the other five are zero. The effect varies across model--task cells. Because the edited representations are held fixed, the gap identifies evaluator reuse as a source of measured damage in this pipeline.
+
+INLP and RLACE do not derive their projection from the scoring decoder and serve as reference interventions. FGSM \citep{goodfellow2015explaining} and PGD \citep{madry2018towards} reach the ceiling under both evaluators at the configured perturbation budget. The current result cannot distinguish an overlarge budget from other sources of saturation. We therefore do not attribute their ceiling behavior to attack strength without an $\epsilon$ sweep.
+
+% BEGIN POST-RUN EPSILON-SWEEP UPDATE
+% Replace the preceding FGSM/PGD limitation paragraph, or append to it, only
+% after the sweep artifacts and plots specified in the handoff pass validation.
+% END POST-RUN EPSILON-SWEEP UPDATE
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.92\linewidth]{figures/fig_circularity.pdf}
+  \caption{Matched-versus-split scoring across \SplitCells{} model--task cells. AlterRep damage falls when the split evaluator scores the attacker's edit. FGSM and PGD are saturated at the configured perturbation budget. Horizontal marks show grand means.}
+  \label{fig:coupling}
+\end{figure}
+
+\section{The audited target cannot rank candidates}
+\label{sec:audited-target}
+
+\paragraph{Benchmark and provenance.}
+The benchmark crosses six transformer families, three binary tasks, three probe architectures, five layers, and 20 seeds. The tasks are subject--verb agreement (SVA) \citep{linzen2016assessing}, SST-2 sentiment \citep{socher2013recursive}, and WinoGender pronoun gender \citep{rudinger2018gender}. The models are BERT-base \citep{devlin2019bert}, GPT-2 \citep{radford2019language}, Pythia-160M \citep{biderman2023pythia}, Qwen2.5-1.5B \citep{qwen2024qwen25}, Gemma-2-2B \citep{gemmateam2024gemma2}, and Llama-3.2-3B \citep{grattafiori2024llama}. Each of the 90 model--layer--task cells contains 60 candidates: linear, MLP, and regularized MLP probes across 20 seeds.
+
+The original preregistration proposed an association between a probe-training Hessian statistic and the Phase-1 reliability target. That prediction failed. We then registered a computation-graph audit, the matched-versus-split control in Section~\ref{sec:split}, and a candidate-dependent replacement with a synthetic validity battery. Appendix~\ref{app:design} records folds, gates, exclusions, and inferential units. We preserve failed tests rather than reclassifying them as validations.
+
+\paragraph{The audited score.}
+Phase 1 trains fixed linear target and control evaluators for each cell. Let $a^{Z_c}_{\mathrm{pre}}$ and $a^{Z_c}_{\mathrm{post},m}$ denote target-evaluator accuracy before and after edit $m$; define $a^{Z_e}$ analogously for the control evaluator. The pipeline records
+\begin{align}
+\widetilde C_m&=\operatorname{clip}\!\left(\frac{a^{Z_c}_{\mathrm{pre}}-a^{Z_c}_{\mathrm{post},m}}{a^{Z_c}_{\mathrm{pre}}-0.5},0,1\right), &
+\widetilde S_m&=\operatorname{clip}\!\left(\frac{a^{Z_e}_{\mathrm{post},m}-0.5}{a^{Z_e}_{\mathrm{pre}}-0.5},0,1\right),
+\end{align}
+then computes $H(C,S)=2CS/(C+S)$ when $C+S>0$, with $H(0,0)=0$, and
+\begin{equation}
+\label{eq:phase1}
+\RPmax(g)=\max_{m\in\{\mathrm{INLP,RLACE,AlterRep,FGSM,PGD}\}}H(\widetilde C_m,\widetilde S_m).
+\end{equation}
+Neither the accuracy ratios nor the maximum in Eq.~\ref{eq:phase1} comes from \citet{canby2025reliable}. Further, $\widetilde C$ measures damage to one fixed decoder. It does not certify information removal.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/fig_pipeline.pdf}
+  \caption{The audited adaptation repeats one target within a cell (left). The candidate-conditioned diagnostic derives an edit from each candidate and uses separately trained evaluators (right), but its direction estimation and scoring still share examples.}
+  \label{fig:pipeline}
+\end{figure}
+
+\paragraph{Candidate independence.}
+The pipeline copies $\RPmax(g)$ to all 60 candidates in cell $g$. All 90 cells therefore contain one distinct target value despite substantial candidate differences. Test accuracy spans $0.46$--$0.94$ on SVA and $0.50$--$0.89$ on SST-2. The registered rank-1 architecture statistic is a forced three-way target tie, broken by list order. Pooled correlations repeat one cell outcome across candidate architectures and seeds; they cannot answer a within-cell ranking question.
+
+For completeness, Proposition~\ref{prop:constant} states this consequence in rank-correlation terms.
+
+\begin{proposition}[Cell-constant targets]
+\label{prop:constant}
+If $T(c,g)=t_g$ for every $c\in\mathcal C_g$, then $T$ induces a complete tie within each cell. Any pooled Spearman association between a candidate statistic $X$ and $T$ contains only between-cell information.
+\end{proposition}
+
+\begin{proof}[Proof sketch]
+Let $U$ and $V$ be the midranks of $X$ and $T$. Since $V=v_g$ within cell $g$, $\operatorname{Cov}(U,V\mid G)=0$. The law of total covariance gives
+\begin{equation}
+\label{eq:covariance}
+\operatorname{Cov}(U,V)
+=\operatorname{Cov}\!\left(\mathbb E[U\mid G],v_G\right).
+\end{equation}
+Candidate replication changes cell weights and the nominal sample size but supplies no within-cell target information. Appendix~\ref{app:proof} gives the complete proof.
+\end{proof}
+
+\paragraph{Max aggregation.}
+Across all 5,400 records, 48.9\% equal $1.0$, the median is $0.9999$, the fifth percentile is $0.95$, and no value is below $0.88$. Holding method scores fixed while replacing the maximum with their mean widens the bug-filtered range from $[0.88,1.00]$ to $[0.32,0.80]$ and removes ceiling mass. This sensitivity diagnoses an aggregation failure; it does not validate the mean as a replacement.
+
+\paragraph{Bug-filtered robustness.}
+The three implementation defects affect model states, labels, or candidate duplication, but not the computation graph that copies one maximum to every candidate. Removing WinoGender, Gemma, and duplicate regularized-MLP rows leaves \BugFilteredN{} records. The target still has median \BugFilteredMedian{}, \BugFilteredCeiling{} are exactly $1.0$, and AlterRep is the first maximum in \BugFilteredAlterRep{} of cases. The structural failure remains after every known affected record is removed.
+
+The score also has an orientation defect. If a balanced decoder moves from perfect accuracy to zero, $\widetilde C=1$ even though complementing every post-edit prediction restores perfect accuracy. Orientation-calibrated accuracy, AUC, log loss, raw confusion matrices, and fresh decoders trained on edited representations distinguish inversion from loss of decodability.
+
+\section{A scored-object validity protocol}
+\label{sec:protocol}
+
+Table~\ref{tab:protocol} turns the observed failure modes into checks that can reject a ranking target before any correlation analysis. Passing every row removes the channels listed here; it does not prove that an edit captures the intended construct.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{p{0.24\linewidth}p{0.33\linewidth}p{0.34\linewidth}}
+\toprule
+Requirement & Falsifying check & Required response \\
+\midrule
+Candidate identity & Trace $T(c,g)$; test variance within $g$ & Derive the edit or estimate from $c$ \\
+Evaluator separation & Compare matched and split scoring & Train the evaluator on separate data \\
+Construct validity & Test inversion, saturation, and fresh decoders & Report damage and redecodability separately \\
+Data separation & Audit direction-fit and scoring examples & Cross-fit direction estimation and scoring \\
+Inferential support & Map shared data, exclusions, and clusters & Resample independent units; publish exclusions \\
+\bottomrule
+\end{tabular}
+\caption{Scored-object validity protocol. Each row states a falsifying check and the minimum design response.}
+\label{tab:protocol}
+\end{table}
+
+We ran the candidate-identity, evaluator-separation, saturation, and dependence-aware inference checks, and we audited the overlap between direction fitting and scoring. The candidate diagnostic still fails the data-separation row because direction estimation and scoring share examples. We did not run orientation calibration or fresh-decoder retraining on the archived Phase-1 and Phase-2 outputs because per-example predictions and edited representations were not persisted. Those rows are requirements of the protocol, not claims that this case study passed them. Our empirical claims therefore stop at fixed-evaluator damage.
+
+% BEGIN POST-RUN ORIENTATION-REDECODABILITY UPDATE
+% Replace the preceding paragraph only after the prespecified one-cell analysis
+% has saved per-example predictions, edited states, split manifests, and fresh-
+% decoder results, and after all leakage tests in the handoff pass.
+% END POST-RUN ORIENTATION-REDECODABILITY UPDATE
+
+\paragraph{Candidate-conditioned diagnostic.}
+We tested $\Dcand$, which takes the leading right-singular direction of each candidate's logit-difference Jacobian, projects that direction from intervention-fold representations, and averages target-damage/control-preservation scores from five evaluators trained on a separate fold. This repairs candidate identity, max aggregation, and direct attacker reuse. It does not establish concept erasure: direction estimation and scoring share examples, the accuracy ratio retains the inversion defect, and a fresh decoder may recover the target.
+
+Synthetic checks plant target and control subspaces while varying shortcut strength and probe architecture. Pooled Kendall $\tau_b$ between $\Dcand$ and planted recovery is $0.799$ for linear candidates and $0.750$ for a held-out nonlinear family. In a post-hoc sensitivity restricted to the same generator replicate and shortcut strength, $\tau_b$ remains $0.720$ and $0.710$, with replicate-bootstrap 95\% intervals $[0.701,0.737]$ and $[0.676,0.747]$. Yet 93.3\% of nonlinear scores fall within $0.02$ of one, above the registered 20\% limit. The locked battery therefore rejects $\Dcand$.
+
+The real-data Hessian association, $\rho=-0.042$, remains descriptive; a post-hoc model--task block bootstrap gives a 95\% interval of $[-0.296,0.268]$. It provides no evidence for or against a basis-invariant relationship between Hessian geometry and valid intervention quality.
+
+\section{Scope, responsible use, and conclusion}
+
+The empirical scope is narrow. The benchmark is internal and previously unpublished; we have not measured how often the same design pattern occurs elsewhere. SVA and SST-2 supply most usable evidence. WinoGender exposes the labeled pronoun and has only 52 direction/scoring examples. The candidate diagnostic removes one direction, protects one control, and uses fixed evaluators. Its synthetic ground truth shares the candidate direction, and its registered nonlinear test fails. Thirty-four of 90 Phase-2 cells are excluded; layer-level exclusions concentrate at shallow layers, while model--task data are reused across layers. No downstream language-model behavior is measured. These limits prevent claims about concept erasure, published prevalence, or Hessian geometry in general.
+
+The original archives also lack Phase-2 per-example predictions, edited representations for fresh-decoder training, failed layer-evaluator accuracies, and Hessian eigenvectors. Orientation and post-edit redecodability are therefore untested in the archived study. We include them in Table~\ref{tab:protocol} because they are necessary falsification checks, not because our pipeline satisfied them.
+
+\paragraph{Responsible use and societal impact.}
+Invalid interpretability scores can support false claims about concept removal, bias mitigation, or model safety. The protocol reduces that risk only when its rows are treated as necessary tests rather than a compliance checklist. We report failed validation and withhold erasure claims where orientation and redecodability are unknown.
+
+Within this pipeline, the same AlterRep edit appears nearly complete under the decoder that generated it and substantially weaker under a separately trained split evaluator. That gap invalidates the score as a probe-quality target. Before interpreting a similar score, trace the scored object, separate edit generation from evaluation, test inversion and redecodability, and align inference with the data-sharing structure.
+
+\clearpage
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\clearpage
+\appendix
+
+\section{Complete proof of Proposition~\ref{prop:constant}}
+\label{app:proof}
+
+Fix a finite set of cells $g$ and candidates $c\in\mathcal C_g$. Assume $T(c,g)=t_g$. For any two candidates $c_1,c_2\in\mathcal C_g$, $T(c_1,g)=T(c_2,g)$, so the target induces a complete within-cell tie. Let $U$ be the pooled midrank of candidate statistic $X$ and $V$ the pooled midrank of $T$. Since $T$ is constant within $g$, $V=v_g$ almost surely conditional on $G=g$. Hence
+\[
+\operatorname{Cov}(U,V\mid G=g)
+=\operatorname{Cov}(U,v_g\mid G=g)=0.
+\]
+The law of total covariance gives
+\begin{align*}
+\operatorname{Cov}(U,V)
+&=\mathbb E[\operatorname{Cov}(U,V\mid G)]
++\operatorname{Cov}(\mathbb E[U\mid G],\mathbb E[V\mid G])\\
+&=\operatorname{Cov}(\mathbb E[U\mid G],v_G).
+\end{align*}
+Spearman correlation is Pearson correlation of midranks, so its covariance numerator contains only covariance between cell-average candidate ranks and cell target ranks. Candidate replication can change cell weights, marginal rank scaling, and the nominal number of rows, but it cannot add target information that distinguishes candidates inside a cell. If every cell has the same target, $V$ has zero variance and the pooled Spearman correlation is undefined.
+
+\section{Experimental design and provenance}
+\label{app:design}
+
+\paragraph{Phase 1.}
+Each model--layer--task cell uses the same extracted representations, target labels, control labels, fixed target/control evaluators, and five interventions for all 60 candidates. The candidate probes differ by architecture and seed. The audited target is the maximum in Eq.~\ref{eq:phase1}. The original prediction used raw mean absolute cosine between flattened probe parameters and the top 20 Hessian eigenvectors. That statistic changes with parameter dimension and with the basis chosen inside repeated eigenspaces, so the failed re-test cannot answer a basis-invariant geometry question.
+
+\paragraph{Matched-versus-split control.}
+For each of six models, we use the middle layer for SVA and SST-2. Five seeded attacker/evaluator pairs train on separate examples. The attacker generates each edit. Target and control damage are then scored once by that attacker and once by its paired evaluator. We compute the primary AlterRep contrast on the \SplitCells{} cell means. The reported percentile interval resamples cells with replacement; the exact sign-flip test flips the sign of each nonzero paired cell difference. A second bootstrap that resamples both cells and the five within-cell pairs gives $[0.164,0.529]$.
+
+\paragraph{Candidate diagnostic.}
+A four-way sentence-disjoint split assigns 40\% of examples to candidate fitting, 20\% to evaluator fitting, 30\% to direction estimation and scoring, and 10\% to candidate testing. A model--task run must pass middle-layer target/control learnability and shuffled-label gates. Each layer then requires five bagged target/control evaluators above $0.60$ out-of-bag accuracy; denominators must exceed a $0.55$ floor. The run yields 3,360 candidate records from 56 of 90 possible cells. Fifteen cells fail model--task gates and 19 fail layer-evaluator gates. Fourteen of the latter occur at the first two sampled layers. Only Pythia and GPT-2 contribute WinoGender cells.
+
+\paragraph{Synthetic validation.}
+The generator draws orthonormal target, control, and shortcut axes in $\mathbb R^{256}$. It varies the probability that shortcut and target labels agree during candidate training, then evaluates with independent target and shortcut labels. Linear ground truth is absolute cosine with the planted target axis. The held-out nonlinear family uses mean principal-angle cosine with a planted two-dimensional XOR subspace. The delivered rows omit one registered correlated target--shortcut condition. The main text reports both pooled and within-replicate/shortcut associations. The registered battery requires all rank, range, dissociation, random-control, and saturation checks; the nonlinear saturation failure fixes the overall outcome.
+
+\section{Additional audit results}
+
+\begin{table}[ht]
+\centering
+\small
+\begin{tabular}{lccccc}
+\toprule
+ & \multicolumn{2}{c}{target damage} & \multicolumn{2}{c}{control preservation} & first max \\
+Method & mean & median & mean & median & (\%) \\
+\midrule
+INLP     & 0.35 & 0.00 & 0.96 & 1.00 & 11.1 \\
+RLACE    & 0.08 & 0.00 & 0.98 & 1.00 & 3.3 \\
+AlterRep & 0.95 & 1.00 & 0.98 & 1.00 & 78.9 \\
+FGSM     & 1.00 & 1.00 & 0.69 & 0.83 & 6.7 \\
+PGD      & 1.00 & 1.00 & 0.69 & 0.83 & 0.0 \\
+\bottomrule
+\end{tabular}
+\caption{Phase-1 method decomposition over 5,400 records. ``First max'' follows the implementation's list-order tie rule, which gives PGD no credit when it ties the earlier FGSM value.}
+\label{tab:methods-app}
+\end{table}
+
+The post-registration Phase-2 re-test is descriptive because the synthetic battery rejects $\Dcand$. Across 168 architecture medians in 56 cells, $\rho(A,\Dcand)=-0.042$ with archived permutation $p=.59$. The registered cell-bootstrap 95\% interval is $[-0.228,0.153]$. Post-hoc intervals are $[-0.296,0.268]$ under a 14-block model--task bootstrap, $[-0.245,0.109]$ under a six-model bootstrap, and $[-0.346,0.278]$ under a model/task/layer hierarchical bootstrap. Within-cell architecture ranks give $\rho=-0.143$, interval $[-0.320,0.041]$. The architecture hit rate is $0.375$ (21/56), interval $[0.241,0.509]$.
+
+\section{Reproducibility and assets}
+The anonymous code supplement is available at
+\href{https://anonymous.4open.science/r/Neurips-Code-Supplement-DE78}
+{this anonymous repository}.
+It contains the benchmark source, analysis scripts, tests, configuration files, registrations, Phase~1 and Phase~2 rows, matched-versus-split outputs, synthetic outputs, and the cell inclusion matrix. The supplement also documents artifacts that were not persisted: Phase~2 per-example predictions, edited representations needed for fresh-decoder analysis, failed layer-evaluator accuracies, and Hessian eigenvectors. These omissions prevent retrospective orientation, redecodability, threshold, and basis-invariant subspace analyses. The repository provides environment-setup instructions and executable commands, although the full original result-generation environment was not preserved. The experiments use publicly available pretrained models and published NLP datasets cited in the main paper; model weights are not redistributed.
+
+\paragraph{Tool assistance.}
+Large-language-model tools supported code implementation but were not part of the evaluated method. The authors reviewed the code, recomputed reported analyses, and retain responsibility for the submission.
+
+\end{document}
+
