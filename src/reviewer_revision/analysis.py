@@ -29,6 +29,12 @@ class AnalysisValidationError(ValueError):
     """Raised when row artifacts cannot support the prespecified analysis."""
 
 
+SCORE_NULL_STATUSES = frozenset(
+    ("pre_target_below_floor", "pre_control_below_floor")
+)
+HARD_FAILURE_STATUSES = frozenset(("failed", "invalid"))
+
+
 @dataclass(frozen=True)
 class CompletenessReport:
     """Exact-key coverage, including explicitly recorded failure units."""
@@ -124,7 +130,12 @@ def validate_expected_keys(
     *,
     status_column: str = "status",
     success_statuses: Sequence[str] = ("ok",),
-    failure_statuses: Sequence[str] = ("failed",),
+    failure_statuses: Sequence[str] = (
+        "failed",
+        "invalid",
+        "pre_target_below_floor",
+        "pre_control_below_floor",
+    ),
     failure_reason_column: str = "failure_reason",
     failure_stage_column: str = "failure_stage",
     raise_on_error: bool = True,
@@ -346,9 +357,10 @@ def validate_paired_edit_hashes(
 ) -> int:
     """Fail closed unless matched/split rows identify one identical edit.
 
-    The return value is the number of validated paired edits.  Explicit failed
-    rows are not treated as edits; inferential summaries reject them through
-    their separate completeness gate.
+    The return value is the number of validated paired edits.  Prespecified
+    score-null rows still identify the shared edit and are validated here;
+    execution-failure rows without an edit are retained for the separate hard
+    failure gate.
     """
 
     frame = load_rows(rows)
@@ -359,12 +371,17 @@ def validate_paired_edit_hashes(
     )
     if not identity_columns:
         raise AnalysisValidationError("paired edit identity columns must not be empty")
-    if "status" in frame:
-        frame = frame.loc[frame["status"].astype(str) == "ok"].copy()
     validated = 0
     grouper: str | list[str]
     grouper = list(identity_columns) if len(identity_columns) > 1 else identity_columns[0]
     for identity, group in frame.groupby(grouper, sort=True, dropna=False):
+        if "status" in group and set(group["status"].astype(str)).issubset(
+            HARD_FAILURE_STATUSES
+        ):
+            # Edit-generation failures can occur before both scoring-condition
+            # rows exist and before an edit hash can be computed.  They still
+            # materialize for audit and are rejected by the stage-level gate.
+            continue
         conditions = {str(value) for value in group[condition_column]}
         if conditions != {"matched", "split"}:
             raise AnalysisValidationError(
@@ -426,15 +443,19 @@ def _validate_for_summary(
     *,
     expected_keys: Iterable[Any] | None,
     key_columns: Sequence[str],
+    allow_score_nulls: bool = False,
 ) -> CompletenessReport:
     if expected_keys is None:
         report = _validate_status_without_expected_keys(frame, key_columns)
     else:
         report = validate_expected_keys(frame, expected_keys, key_columns)
-    if report.failure_count:
+    statuses = frame["status"].astype(str)
+    hard_failure_count = int(statuses.isin(HARD_FAILURE_STATUSES).sum())
+    score_null_count = int(statuses.isin(SCORE_NULL_STATUSES).sum())
+    if hard_failure_count or (score_null_count and not allow_score_nulls):
         raise AnalysisValidationError(
-            f"cannot calculate inferential summary with {report.failure_count} "
-            "explicit failed units"
+            "cannot calculate inferential summary with explicit failed units: "
+            f"{hard_failure_count} hard failures and {score_null_count} score-null units"
         )
     return report
 
@@ -689,10 +710,11 @@ def summarize_matched_split(
     """Summarize matched-versus-split damage with block-aware inference."""
 
     frame = load_rows(rows)
-    report = _validate_for_summary(
+    _validate_for_summary(
         frame,
         expected_keys=expected_keys,
         key_columns=key_columns,
+        allow_score_nulls=True,
     )
     model_col = _resolve_column(frame, "model", "model_key")
     task_col = _resolve_column(frame, "task", "task_key")
@@ -702,21 +724,24 @@ def summarize_matched_split(
     edit_hash_col = _resolve_edit_hash_column(frame, ("edit_hash",))
     _require_columns(frame, ("layer", "pair_seed"))
 
-    primary = frame.loc[frame[method_col].astype(str) == primary_method].copy()
-    if primary.empty:
+    primary_requested = frame.loc[
+        frame[method_col].astype(str) == primary_method
+    ].copy()
+    if primary_requested.empty:
         raise AnalysisValidationError(
             f"no rows found for primary method {primary_method!r}"
         )
-    _require_finite(primary, (damage_col,))
     pair_columns = [model_col, task_col, "layer", "pair_seed"]
-    duplicate_mask = primary.duplicated([*pair_columns, condition_col], keep=False)
+    duplicate_mask = primary_requested.duplicated(
+        [*pair_columns, condition_col], keep=False
+    )
     if duplicate_mask.any():
         raise AnalysisValidationError(
             "matched/split rows contain duplicate pair-condition keys"
         )
-    condition_sets = primary.groupby(pair_columns, sort=True)[condition_col].agg(
-        lambda values: frozenset(str(value) for value in values)
-    )
+    condition_sets = primary_requested.groupby(
+        pair_columns, sort=True, dropna=False
+    )[condition_col].agg(lambda values: frozenset(str(value) for value in values))
     invalid_conditions = condition_sets[
         condition_sets != frozenset(("matched", "split"))
     ]
@@ -726,11 +751,34 @@ def summarize_matched_split(
             f"invalid pairs: {list(invalid_conditions.index[:10])!r}"
         )
     validated_edit_pairs = validate_paired_edit_hashes(
-        primary,
+        primary_requested,
         identity_columns=pair_columns,
         condition_column=condition_col,
         edit_hash_column=edit_hash_col,
     )
+
+    complete_pair_mask = primary_requested.groupby(
+        pair_columns, sort=False, dropna=False
+    )["status"].transform(lambda values: bool((values.astype(str) == "ok").all()))
+    primary = primary_requested.loc[complete_pair_mask].copy()
+    if primary.empty:
+        raise AnalysisValidationError(
+            "no complete matched/split pairs remain after applying the locked score floor"
+        )
+    _require_finite(primary, (damage_col,))
+    requested_pair_count = len(condition_sets)
+    analyzed_pair_count = int(
+        primary[pair_columns].drop_duplicates().shape[0]
+    )
+    score_null_primary = primary_requested.loc[
+        primary_requested["status"].astype(str).isin(SCORE_NULL_STATUSES)
+    ]
+    excluded_pair_keys = [
+        tuple(_python_scalar(value) for value in key)
+        for key in primary_requested.loc[~complete_pair_mask, pair_columns]
+        .drop_duplicates()
+        .itertuples(index=False, name=None)
+    ]
 
     paired = (
         primary.set_index([*pair_columns, condition_col])[damage_col]
@@ -745,12 +793,13 @@ def summarize_matched_split(
         ]
         .mean()
     )
-    if "depth_position" in primary:
-        depth_counts = primary.groupby(cell_columns)["depth_position"].nunique()
+    requested_cells = primary_requested[cell_columns].drop_duplicates()
+    if "depth_position" in primary_requested:
+        depth_counts = primary_requested.groupby(cell_columns)["depth_position"].nunique()
         if (depth_counts != 1).any():
             raise AnalysisValidationError("depth_position changes within a cell")
         depths = (
-            primary.groupby(cell_columns, as_index=False)["depth_position"]
+            primary_requested.groupby(cell_columns, as_index=False)["depth_position"]
             .first()
         )
         cells = cells.merge(depths, on=cell_columns, validate="one_to_one")
@@ -771,6 +820,10 @@ def summarize_matched_split(
         raise AnalysisValidationError(
             f"matched/split summary expected {expected_blocks} model-task blocks, "
             f"observed {len(blocks)}"
+        )
+    if len(cells) != len(requested_cells):
+        raise AnalysisValidationError(
+            "the locked score floor removed every pair from at least one requested cell"
         )
 
     bootstrap_frame = paired.rename(
@@ -844,7 +897,7 @@ def summarize_matched_split(
                 "target_acc_pre",
                 "raw_target_accuracy_pre",
             )
-            if name in primary
+            if name in primary_requested
         ),
         None,
     )
@@ -856,7 +909,7 @@ def summarize_matched_split(
                 "target_acc_post",
                 "raw_target_accuracy_post",
             )
-            if name in primary
+            if name in primary_requested
         ),
         None,
     )
@@ -870,11 +923,13 @@ def summarize_matched_split(
             "reason": "pre/post target accuracy columns are absent",
         }
     else:
-        _require_finite(primary, (pre_accuracy_col, post_accuracy_col))
+        _require_finite(
+            primary_requested, (pre_accuracy_col, post_accuracy_col)
+        )
         target_accuracy_distributions = {"available": True, "unit": "pair_row"}
         for condition in ("matched", "split"):
-            condition_rows = primary.loc[
-                primary[condition_col].astype(str) == condition
+            condition_rows = primary_requested.loc[
+                primary_requested[condition_col].astype(str) == condition
             ]
             target_accuracy_distributions[condition] = {
                 "pre": _distribution_summary(condition_rows[pre_accuracy_col]),
@@ -891,13 +946,30 @@ def summarize_matched_split(
             "cell and selected layers within each equally weighted model-task block."
         ),
         "included_units": {
+            "rows": len(primary_requested),
+            "pairs": requested_pair_count,
+            "cells": int(n_cells),
+            "model_task_blocks": int(n_blocks),
+        },
+        "analyzed_units": {
             "rows": len(primary),
-            "pairs": len(paired),
+            "pairs": analyzed_pair_count,
             "cells": int(n_cells),
             "model_task_blocks": int(n_blocks),
         },
         "validated_paired_edit_hashes": int(validated_edit_pairs),
-        "failed_units": int(report.failure_count),
+        "failed_units": int(
+            frame["status"].astype(str).isin(HARD_FAILURE_STATUSES).sum()
+        ),
+        "score_null_units": int(
+            frame["status"].astype(str).isin(SCORE_NULL_STATUSES).sum()
+        ),
+        "primary_score_null_units": len(score_null_primary),
+        "primary_score_null_pairs": requested_pair_count - analyzed_pair_count,
+        "primary_score_null_status_counts": dict(
+            Counter(score_null_primary["status"].astype(str))
+        ),
+        "excluded_primary_pair_keys": excluded_pair_keys,
         "grand_mean_matched": grand_matched,
         "grand_mean_split": grand_split,
         "grand_mean_gap": grand_gap,
@@ -940,6 +1012,12 @@ def summarize_matched_split(
                         f"{n_cells} model-layer-task cells are nested in "
                         f"{n_blocks} model-task blocks."
                     ),
+                    (
+                        f"{requested_pair_count - analyzed_pair_count} prespecified "
+                        "pairs had a denominator below the locked floor; both "
+                        "conditions for each affected pair are excluded from the "
+                        "paired estimand and remain explicit in the row artifacts."
+                    ),
                     "Fixed-decoder target damage is not evidence of erasure.",
                 )
             ),
@@ -972,10 +1050,11 @@ def summarize_epsilon_sweep(
     """Summarize the complete paired FGSM/PGD epsilon grid."""
 
     frame = load_rows(rows)
-    report = _validate_for_summary(
+    _validate_for_summary(
         frame,
         expected_keys=expected_keys,
         key_columns=key_columns,
+        allow_score_nulls=True,
     )
     model_col = _resolve_column(frame, "model", "model_key")
     task_col = _resolve_column(frame, "task", "task_key")
@@ -989,6 +1068,45 @@ def summarize_epsilon_sweep(
         raise AnalysisValidationError(
             "nonmonotonic reversal threshold must be non-negative"
         )
+
+    requested_frame = frame.copy()
+    paired_keys = [
+        model_col,
+        task_col,
+        "layer",
+        "pair_seed",
+        method_col,
+        epsilon_col,
+    ]
+    condition_duplicates = requested_frame.duplicated(
+        [*paired_keys, condition_col], keep=False
+    )
+    if condition_duplicates.any():
+        raise AnalysisValidationError("epsilon rows contain duplicate condition keys")
+    condition_sets = requested_frame.groupby(
+        paired_keys, sort=True, dropna=False
+    )[condition_col].agg(lambda values: frozenset(str(value) for value in values))
+    if (condition_sets != frozenset(("matched", "split"))).any():
+        raise AnalysisValidationError(
+            "every epsilon unit must contain exactly matched and split rows"
+        )
+    validated_edit_pairs = validate_paired_edit_hashes(
+        requested_frame,
+        identity_columns=paired_keys,
+        condition_column=condition_col,
+        edit_hash_column=edit_hash_col,
+    )
+    complete_pair_mask = requested_frame.groupby(
+        paired_keys, sort=False, dropna=False
+    )["status"].transform(lambda values: bool((values.astype(str) == "ok").all()))
+    frame = requested_frame.loc[complete_pair_mask].copy()
+    if frame.empty:
+        raise AnalysisValidationError(
+            "no complete epsilon pairs remain after applying the locked score floor"
+        )
+    score_null_rows = requested_frame.loc[
+        requested_frame["status"].astype(str).isin(SCORE_NULL_STATUSES)
+    ]
 
     metric_aliases = {
         "target_damage_C": damage_col,
@@ -1037,8 +1155,10 @@ def summarize_epsilon_sweep(
         raise AnalysisValidationError("target_damage_C must lie in [0, 1]")
 
     if "realized_linf_norm" in present_metrics:
-        norms = frame[present_metrics["realized_linf_norm"]].to_numpy(dtype=float)
-        epsilons = frame[epsilon_col].to_numpy(dtype=float)
+        norm_source = present_metrics["realized_linf_norm"]
+        _require_finite(requested_frame, (norm_source, epsilon_col))
+        norms = requested_frame[norm_source].to_numpy(dtype=float)
+        epsilons = requested_frame[epsilon_col].to_numpy(dtype=float)
         if (norms < -norm_tolerance).any() or (norms > epsilons + norm_tolerance).any():
             raise AnalysisValidationError(
                 "realized perturbation violates the requested L-infinity bound"
@@ -1052,6 +1172,7 @@ def summarize_epsilon_sweep(
         condition_col,
         epsilon_col,
     ]
+    requested_cells = requested_frame[cell_columns].drop_duplicates()
     cells = (
         frame.groupby(cell_columns, sort=True, as_index=False)[
             list(present_metrics.values())
@@ -1059,6 +1180,11 @@ def summarize_epsilon_sweep(
         .mean()
         .rename(columns={source: canonical for canonical, source in present_metrics.items()})
     )
+    if len(cells) != len(requested_cells):
+        raise AnalysisValidationError(
+            "the locked score floor removed every pair from at least one requested "
+            "epsilon cell"
+        )
     curves: list[dict[str, Any]] = []
     for (method, condition, epsilon), group in cells.groupby(
         [method_col, condition_col, epsilon_col], sort=True
@@ -1094,39 +1220,44 @@ def summarize_epsilon_sweep(
             row[f"mean_{metric}"] = float(group[metric].mean())
         curves.append(row)
 
-    zero = frame.loc[np.isclose(frame[epsilon_col].to_numpy(dtype=float), 0.0)].copy()
+    zero_requested = requested_frame.loc[
+        np.isclose(requested_frame[epsilon_col].to_numpy(dtype=float), 0.0)
+    ].copy()
+    zero = frame.loc[
+        np.isclose(frame[epsilon_col].to_numpy(dtype=float), 0.0)
+    ].copy()
     if zero.empty:
         raise AnalysisValidationError("epsilon sweep contains no epsilon-zero rows")
     max_damage = float(np.max(np.abs(zero[damage_col].to_numpy(dtype=float))))
     norm_column = present_metrics.get("realized_linf_norm")
     max_norm = (
-        float(np.max(np.abs(zero[norm_column].to_numpy(dtype=float))))
+        float(np.max(np.abs(zero_requested[norm_column].to_numpy(dtype=float))))
         if norm_column is not None
         else 0.0
     )
-    zero_passed = max_damage <= zero_tolerance and max_norm <= norm_tolerance
+    pre_source = present_metrics.get("target_accuracy_pre")
+    post_source = present_metrics.get("target_accuracy_post")
+    max_accuracy_noop_difference = 0.0
+    if pre_source is not None and post_source is not None:
+        _require_finite(zero_requested, (pre_source, post_source))
+        max_accuracy_noop_difference = float(
+            np.max(
+                np.abs(
+                    zero_requested[pre_source].to_numpy(dtype=float)
+                    - zero_requested[post_source].to_numpy(dtype=float)
+                )
+            )
+        )
+    zero_passed = (
+        max_damage <= zero_tolerance
+        and max_norm <= norm_tolerance
+        and max_accuracy_noop_difference <= zero_tolerance
+    )
     if not zero_passed:
         raise AnalysisValidationError(
             "epsilon-zero integrity failed: expected an exact no-op within tolerance"
         )
 
-    paired_keys = [model_col, task_col, "layer", "pair_seed", method_col, epsilon_col]
-    condition_duplicates = frame.duplicated([*paired_keys, condition_col], keep=False)
-    if condition_duplicates.any():
-        raise AnalysisValidationError("epsilon rows contain duplicate condition keys")
-    condition_sets = frame.groupby(paired_keys, sort=True)[condition_col].agg(
-        lambda values: frozenset(str(value) for value in values)
-    )
-    if (condition_sets != frozenset(("matched", "split"))).any():
-        raise AnalysisValidationError(
-            "every epsilon unit must contain exactly matched and split rows"
-        )
-    validated_edit_pairs = validate_paired_edit_hashes(
-        frame,
-        identity_columns=paired_keys,
-        condition_column=condition_col,
-        edit_hash_column=edit_hash_col,
-    )
     paired = (
         frame.set_index([*paired_keys, condition_col])[damage_col]
         .unstack(condition_col)
@@ -1176,14 +1307,30 @@ def summarize_epsilon_sweep(
             "for FGSM/PGD and matched/split scoring."
         ),
         "included_units": {
+            "rows": len(requested_frame),
+            "cells": len(requested_cells),
+            "model_task_blocks": int(
+                requested_frame[[model_col, task_col]].drop_duplicates().shape[0]
+            ),
+        },
+        "analyzed_units": {
             "rows": len(frame),
+            "paired_units": int(frame[paired_keys].drop_duplicates().shape[0]),
             "cells": len(cells),
             "model_task_blocks": int(
                 frame[[model_col, task_col]].drop_duplicates().shape[0]
             ),
         },
         "validated_paired_edit_hashes": int(validated_edit_pairs),
-        "failed_units": int(report.failure_count),
+        "failed_units": int(
+            requested_frame["status"].astype(str).isin(HARD_FAILURE_STATUSES).sum()
+        ),
+        "score_null_units": len(score_null_rows),
+        "score_null_pairs": len(condition_sets)
+        - int(frame[paired_keys].drop_duplicates().shape[0]),
+        "score_null_status_counts": dict(
+            Counter(score_null_rows["status"].astype(str))
+        ),
         "curves": curves,
         "paired_gap_curves": gap_curves,
         "large_nonmonotonic_reversals": large_reversals,
@@ -1192,9 +1339,12 @@ def summarize_epsilon_sweep(
             nonmonotonic_reversal_threshold
         ),
         "epsilon_zero_integrity": {
-            "row_count": len(zero),
+            "row_count": len(zero_requested),
+            "analyzed_damage_row_count": len(zero),
+            "score_null_row_count": len(zero_requested) - len(zero),
             "max_abs_target_damage_C": max_damage,
             "max_realized_linf_norm": max_norm,
+            "max_abs_target_accuracy_noop_difference": max_accuracy_noop_difference,
             "passed": bool(zero_passed),
         },
         "confidence_interval_method": "model_task_cluster_bootstrap_for_figures",
@@ -1209,6 +1359,12 @@ def summarize_epsilon_sweep(
                 caveats
                 or (
                     "The complete prespecified epsilon grid is reported; no epsilon is selected post hoc.",
+                    (
+                        f"{len(condition_sets) - int(frame[paired_keys].drop_duplicates().shape[0])} "
+                        "paired epsilon units had a denominator below the locked "
+                        "floor; both scoring conditions remain explicit and are "
+                        "excluded symmetrically from curve estimates."
+                    ),
                     "Fixed-decoder target damage is not evidence of erasure.",
                 )
             ),

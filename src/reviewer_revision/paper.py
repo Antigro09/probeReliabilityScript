@@ -114,6 +114,7 @@ def _validate_common(section: Mapping[str, Any], name: str) -> None:
 
 def _validate_matched(section: Mapping[str, Any]) -> None:
     included = _require_mapping(section, "included_units", "matched_split")
+    analyzed = _require_mapping(section, "analyzed_units", "matched_split")
     cells = included.get("cells")
     blocks = included.get("model_task_blocks")
     pairs = included.get("pairs")
@@ -123,6 +124,27 @@ def _validate_matched(section: Mapping[str, Any]) -> None:
         raise ManuscriptValidationError("matched_split must contain 12 model-task blocks")
     if pairs != int(cells) * 5:
         raise ManuscriptValidationError("matched_split must contain five pairs per cell")
+    analyzed_pairs = analyzed.get("pairs")
+    score_null_pairs = section.get("primary_score_null_pairs")
+    if (
+        not isinstance(analyzed_pairs, int)
+        or isinstance(score_null_pairs, bool)
+        or not isinstance(score_null_pairs, int)
+        or analyzed_pairs <= 0
+        or score_null_pairs < 0
+        or analyzed_pairs + score_null_pairs != pairs
+    ):
+        raise ManuscriptValidationError(
+            "matched_split requested, analyzed, and score-null pair counts disagree"
+        )
+    if analyzed.get("rows") != 2 * analyzed_pairs:
+        raise ManuscriptValidationError(
+            "matched_split analyzed rows must contain both conditions per analyzed pair"
+        )
+    if analyzed.get("cells") != cells or analyzed.get("model_task_blocks") != blocks:
+        raise ManuscriptValidationError(
+            "matched_split score-floor exclusions removed a requested cell or block"
+        )
     matched = _require_number(section, "grand_mean_matched", "matched_split")
     split = _require_number(section, "grand_mean_split", "matched_split")
     gap = _require_number(section, "grand_mean_gap", "matched_split")
@@ -166,6 +188,51 @@ def _curve_key(row: Mapping[str, Any]) -> tuple[str, str, float]:
 
 
 def _validate_epsilon(section: Mapping[str, Any]) -> None:
+    included = _require_mapping(section, "included_units", "epsilon_sweep")
+    analyzed = _require_mapping(section, "analyzed_units", "epsilon_sweep")
+    score_null_pairs = section.get("score_null_pairs")
+    score_null_units = section.get("score_null_units")
+    if (
+        isinstance(score_null_pairs, bool)
+        or not isinstance(score_null_pairs, int)
+        or isinstance(score_null_units, bool)
+        or not isinstance(score_null_units, int)
+        or score_null_pairs < 0
+        or score_null_units < 0
+    ):
+        raise ManuscriptValidationError(
+            "epsilon_sweep score-null counts must be non-negative integers"
+        )
+    included_rows = included.get("rows")
+    analyzed_rows = analyzed.get("rows")
+    analyzed_pairs = analyzed.get("paired_units")
+    if (
+        not isinstance(included_rows, int)
+        or not isinstance(analyzed_rows, int)
+        or not isinstance(analyzed_pairs, int)
+        or included_rows <= 0
+        or analyzed_rows <= 0
+        or analyzed_pairs <= 0
+    ):
+        raise ManuscriptValidationError(
+            "epsilon_sweep requested and analyzed unit counts must be positive integers"
+        )
+    if included_rows - analyzed_rows != 2 * score_null_pairs:
+        raise ManuscriptValidationError(
+            "epsilon_sweep must exclude both conditions of each score-null pair"
+        )
+    if analyzed_rows != 2 * analyzed_pairs:
+        raise ManuscriptValidationError(
+            "epsilon_sweep analyzed rows must contain both conditions per paired unit"
+        )
+    if score_null_units > 2 * score_null_pairs:
+        raise ManuscriptValidationError(
+            "epsilon_sweep score-null rows exceed their paired exclusions"
+        )
+    if analyzed.get("cells") != included.get("cells"):
+        raise ManuscriptValidationError(
+            "epsilon_sweep score-floor exclusions removed a requested cell"
+        )
     zero = _require_mapping(section, "epsilon_zero_integrity", "epsilon_sweep")
     if zero.get("passed") is not True:
         raise ManuscriptValidationError("epsilon_sweep is incomplete because epsilon zero failed")
@@ -372,6 +439,8 @@ def _macro_lines(summary: Mapping[str, Any]) -> list[str]:
         ("SplitCells", str(included["cells"])),
         ("SplitBlocks", str(included["model_task_blocks"])),
         ("SplitPairs", str(included["pairs"])),
+        ("SplitAnalyzedPairs", str(matched["analyzed_units"]["pairs"])),
+        ("SplitScoreNullPairs", str(matched["primary_score_null_pairs"])),
         ("SplitMatched", str(manuscript["matched"])),
         ("SplitIndependent", str(manuscript["split"])),
         ("SplitGap", str(manuscript["gap"])),
@@ -465,8 +534,18 @@ def _epsilon_prose(summary: Mapping[str, Any]) -> str:
             "perturbation magnitude alone."
         )
     reversal_diagnostic = _epsilon_reversal_prose(section)
+    score_null_pairs = int(section["score_null_pairs"])
+    score_null_units = int(section["score_null_units"])
+    floor_note = ""
+    if score_null_pairs:
+        floor_note = (
+            f" The locked denominator floor produced {score_null_units} null score rows "
+            f"across {score_null_pairs} paired epsilon units; both scoring conditions "
+            "of every affected unit remain in the row artifact and are excluded "
+            "symmetrically from curve estimates."
+        )
     return rf"""\paragraph{{Perturbation-budget sweep.}}
-At the archived $\epsilon=0.5$ budget, FGSM has matched and split damage \FGSMArchivedMatched{{}} and \FGSMArchivedSplit{{}}, while PGD has \PGDArchivedMatched{{}} and \PGDArchivedSplit{{}}. {interpretation} {reversal_diagnostic}
+At the archived $\epsilon=0.5$ budget, FGSM has matched and split damage \FGSMArchivedMatched{{}} and \FGSMArchivedSplit{{}}, while PGD has \PGDArchivedMatched{{}} and \PGDArchivedSplit{{}}. {interpretation} {reversal_diagnostic}{floor_note}
 
 \begin{{figure}}[t]
   \centering
@@ -542,7 +621,23 @@ def patch_manuscript(
     cells = int(summary["matched_split"]["included_units"]["cells"])
     blocks = int(summary["matched_split"]["included_units"]["model_task_blocks"])
     pairs = int(summary["matched_split"]["included_units"]["pairs"])
+    analyzed_pairs = int(summary["matched_split"]["analyzed_units"]["pairs"])
+    score_null_pairs = int(summary["matched_split"]["primary_score_null_pairs"])
     depths = cells // blocks
+    matched_floor_note = ""
+    matched_result_note = ""
+    if score_null_pairs:
+        matched_floor_note = (
+            f" The locked denominator floor yielded {score_null_pairs} affected "
+            f"pair units; all {pairs} requested pairs remain in the row artifact, "
+            f"while both conditions of each affected pair are excluded symmetrically, "
+            f"leaving {analyzed_pairs} pairs in the paired estimand."
+        )
+        matched_result_note = (
+            f" The estimate uses {analyzed_pairs} complete pairs; the "
+            f"{score_null_pairs} denominator-floor pairs remain explicit in the row "
+            "artifact with both conditions excluded symmetrically."
+        )
     text = _replace_exact(
         text,
         r"over \SplitCells{} model--task cells",
@@ -582,7 +677,7 @@ def patch_manuscript(
         "examples. The attacker generates each edit, and both conditions score its identical "
         "tensor. We average the five pair contrasts within each model--layer--task cell and use "
         f"the {blocks} model--task blocks as the independent units for primary inference "
-        f"({pairs} pair units total)."
+        f"({pairs} requested pair units total).{matched_floor_note}"
     )
     text = _replace_exact(text, old_design, new_design, "matched/split design paragraph")
     old_result = (
@@ -599,7 +694,7 @@ def patch_manuscript(
         "\\SplitGap{}, with a 95\\% hierarchical block-bootstrap interval of \\SplitCI{} and "
         "primary exact two-sided block sign-flip $p=\\SplitP$. Because both conditions score "
         "the identical edited tensor, the gap identifies evaluator reuse as a source of measured "
-        "damage in this pipeline."
+        f"damage in this pipeline.{matched_result_note}"
     )
     text = _replace_exact(text, old_result, new_result, "matched/split result paragraph")
 
@@ -618,7 +713,9 @@ def patch_manuscript(
         f"model--layer--task cells nested in {blocks} model--task blocks. Panel A shows "
         "paired cell means for the identical edits; the grand matched and split means are "
         "\\SplitMatched{} and \\SplitIndependent{}. Panel B shows all block depth trajectories "
-        "and the equal-block mean gap with a 95\\% hierarchical interval.}"
+        "and the equal-block mean gap with a 95\\% hierarchical interval. Denominator-floor "
+        f"nulls affect {score_null_pairs} of {pairs} requested pair units and are excluded "
+        "symmetrically.}"
     )
     text = _replace_exact(text, old_caption, new_caption, "expanded figure caption")
 
@@ -659,7 +756,10 @@ def patch_manuscript(
         "Five seeded attacker/evaluator pairs train on separate sentence groups. Each attacker "
         "generates one edit that is hashed and scored unchanged by its matched and split "
         f"evaluators, yielding {pairs} pair units in {cells} cells nested in {blocks} model--task "
-        "blocks. We average pairs within cells and layers within equally weighted blocks. The "
+        f"blocks. The locked denominator floor excludes both conditions for {score_null_pairs} "
+        f"affected pairs from numerical summaries ({analyzed_pairs} analyzed pairs) while "
+        "retaining every requested row and reason in the artifact. We average valid pairs "
+        "within cells and layers within equally weighted blocks. The "
         "primary 95\\% interval hierarchically resamples model--task blocks, layers, and pairs; "
         "the primary exact sign-flip test flips the nonzero block contrasts."
     )

@@ -405,6 +405,7 @@ def _environment_report(device: torch.device) -> dict[str, Any]:
         "device_protocol": {
             "transformer_extraction": str(device),
             "candidate_mlp_and_jacobian": str(device),
+            "candidate_linear_and_mka": "cpu",
             "linear_attackers_and_evaluators": "cpu",
             "fresh_decoders": "cpu",
             "statistics": "cpu",
@@ -1789,7 +1790,7 @@ def _pre_edit_metrics(
 
 
 def _normalize_score_status(row: dict[str, Any]) -> dict[str, Any]:
-    """Map scientific score null reasons to explicit experiment failure rows."""
+    """Preserve prespecified score-null statuses separately from hard failures."""
 
     score_status = row.get("status")
     reason = row.pop("reason", None)
@@ -1797,10 +1798,16 @@ def _normalize_score_status(row: dict[str, Any]) -> dict[str, Any]:
     if score_status == "ok":
         row["failure_reason"] = None
     else:
-        row["status"] = "failed"
+        row["status"] = score_status
         row["failure_reason"] = reason or f"damage score status: {score_status}"
         row["failure_stage"] = "scoring"
     return row
+
+
+def _hard_failure_mask(frame: pd.DataFrame) -> pd.Series:
+    """Return rows that reflect execution/integrity failures, not score nulls."""
+
+    return frame["status"].astype(str).isin(("failed", "invalid"))
 
 
 def _matched_edit_path(context: RunContext, key: tuple[Any, ...]) -> Path:
@@ -2395,7 +2402,7 @@ def run_matched_split(
         parquet_name="matched_split_rows.parquet",
         key_columns=("model_key", "task", "layer", "pair_seed", "method", "condition"),
     )
-    if fatal_errors or (frame["status"] == "failed").any():
+    if fatal_errors or _hard_failure_mask(frame).any():
         context.update_manifest(
             {"matched_split": {"status": "failed", "errors": fatal_errors[:20]}}
         )
@@ -2680,6 +2687,16 @@ def _validate_epsilon_baseline_against_matched(
         "control_acc_pre",
         "control_acc_post",
     ]
+    comparison_columns = [*key_columns, "edit_hash", "status", *numeric_columns]
+    for name, comparison_frame in (
+        ("Experiment A", matched_frame),
+        ("epsilon sweep", epsilon_frame),
+    ):
+        missing = [
+            column for column in comparison_columns if column not in comparison_frame
+        ]
+        if missing:
+            raise ValueError(f"{name} comparison rows lack columns: {missing!r}")
     required = epsilon_frame.loc[
         (epsilon_frame["epsilon_scope"] == "required_middle")
         & np.isclose(epsilon_frame["epsilon"].astype(float), 0.5)
@@ -2715,13 +2732,28 @@ def _validate_epsilon_baseline_against_matched(
     ].astype(str)
     if hash_mismatch.any():
         raise ValueError("epsilon=.5 edit hash differs from Experiment A")
+    status_mismatch = combined["status_epsilon"].astype(str) != combined[
+        "status_matched"
+    ].astype(str)
+    if status_mismatch.any():
+        raise ValueError("epsilon=.5 score status differs from Experiment A")
     maximum_deviations: dict[str, float] = {}
     for column in numeric_columns:
         left = combined[f"{column}_epsilon"].astype(float).to_numpy()
         right = combined[f"{column}_matched"].astype(float).to_numpy()
-        deviation = float(np.max(np.abs(left - right))) if len(left) else 0.0
+        asymmetric_null = np.isnan(left) != np.isnan(right)
+        if asymmetric_null.any():
+            raise ValueError(
+                f"epsilon=.5 {column} null pattern differs from Experiment A"
+            )
+        finite = np.isfinite(left) & np.isfinite(right)
+        deviation = (
+            float(np.max(np.abs(left[finite] - right[finite])))
+            if finite.any()
+            else 0.0
+        )
         maximum_deviations[column] = deviation
-        if not np.allclose(left, right, rtol=0.0, atol=1.0e-12):
+        if not np.allclose(left, right, rtol=0.0, atol=1.0e-12, equal_nan=True):
             raise ValueError(
                 f"epsilon=.5 {column} differs from Experiment A; max={deviation}"
             )
@@ -2729,6 +2761,7 @@ def _validate_epsilon_baseline_against_matched(
         "passed": True,
         "rows": len(combined),
         "edit_hashes_equal": True,
+        "score_statuses_equal": True,
         "numeric_absolute_tolerance": 1.0e-12,
         "maximum_absolute_deviations": maximum_deviations,
     }
@@ -2933,7 +2966,7 @@ def run_epsilon_sweep(
         parquet_name="epsilon_sweep_rows.parquet",
         key_columns=("model_key", "task", "layer", "pair_seed", "method", "epsilon", "condition"),
     )
-    if fatal_errors or (frame["status"] == "failed").any():
+    if fatal_errors or _hard_failure_mask(frame).any():
         context.update_manifest(
             {"epsilon_sweep": {"status": "failed", "errors": fatal_errors[:20]}}
         )
@@ -3588,6 +3621,19 @@ def _validate_rank_one_reconstruction(
     }
 
 
+def _construct_candidate_device(
+    architecture: str,
+    accelerator_eligible_device: torch.device,
+) -> torch.device:
+    """Route only the permitted MLP candidate/Jacobian work to an accelerator."""
+
+    return (
+        accelerator_eligible_device
+        if architecture == "mlp"
+        else torch.device("cpu")
+    )
+
+
 def run_construct_check(
     context: RunContext,
     config: RevisionConfig,
@@ -3898,10 +3944,9 @@ def run_construct_check(
                         },
                     )
             else:
-                candidate_device = (
-                    device
-                    if edit_key.architecture == "mlp"
-                    else torch.device("cpu")
+                candidate_device = _construct_candidate_device(
+                    edit_key.architecture,
+                    device,
                 )
                 candidate, candidate_checkpoint_hash = _construct_candidate(
                     context,

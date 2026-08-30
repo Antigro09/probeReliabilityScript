@@ -9,6 +9,9 @@ from PIL import Image
 
 from src.reviewer_revision.figures import (
     FigureValidationError,
+    _epsilon_work,
+    _matched_pair_rows,
+    _saved_rows,
     create_construct_check_figure,
     create_epsilon_sweep_figure,
     create_expanded_matched_split_figure,
@@ -199,6 +202,66 @@ def test_epsilon_figure_contains_locked_grid_and_ceiling_companion(tmp_path: Pat
         create_epsilon_sweep_figure(incomplete_path, tmp_path / "bad")
 
 
+def test_matched_figure_rows_exclude_both_conditions_of_score_null_pair(
+    tmp_path: Path,
+) -> None:
+    rows = _matched_rows()
+    affected = (
+        (rows["model"] == "pythia")
+        & (rows["task"] == "sva")
+        & (rows["layer"] == 1)
+        & (rows["pair_seed"] == 0)
+        & (rows["condition"] == "split")
+    )
+    rows.loc[affected, "target_damage_C"] = pd.NA
+    rows.loc[affected, "status"] = "pre_target_below_floor"
+    rows.loc[affected, "failure_stage"] = "scoring"
+    rows.loc[affected, "failure_reason"] = "target denominator below floor"
+    path = tmp_path / "matched-score-null.csv"
+    rows.to_csv(path, index=False)
+
+    paired = _matched_pair_rows(_saved_rows(path))
+
+    assert len(paired) == 299
+    assert not (
+        (paired["model"] == "pythia")
+        & (paired["task"] == "sva")
+        & (paired["layer"] == 1)
+        & (paired["pair_seed"] == 0)
+    ).any()
+
+
+def test_epsilon_figure_rows_exclude_both_conditions_of_score_null_pair(
+    tmp_path: Path,
+) -> None:
+    rows = _epsilon_rows()
+    affected = (
+        (rows["model"] == "pythia")
+        & (rows["task"] == "sva")
+        & (rows["pair_seed"] == 0)
+        & (rows["method"] == "fgsm")
+        & (rows["epsilon"] == 0.25)
+        & (rows["condition"] == "split")
+    )
+    rows.loc[affected, "target_damage_C"] = pd.NA
+    rows.loc[affected, "status"] = "pre_target_below_floor"
+    rows.loc[affected, "failure_stage"] = "scoring"
+    rows.loc[affected, "failure_reason"] = "target denominator below floor"
+    path = tmp_path / "epsilon-score-null.csv"
+    rows.to_csv(path, index=False)
+
+    work = _epsilon_work(_saved_rows(path))
+
+    assert len(work) == 2_398
+    assert not (
+        (work["model"] == "pythia")
+        & (work["task"] == "sva")
+        & (work["pair_seed"] == 0)
+        & (work["method"] == "fgsm")
+        & (work["epsilon"] == 0.25)
+    ).any()
+
+
 def test_construct_figure_aligns_sixty_candidate_endpoint_distributions(
     tmp_path: Path,
 ) -> None:
@@ -290,6 +353,13 @@ def _summary_payload() -> dict[str, object]:
                 "cells": 60,
                 "model_task_blocks": 12,
             },
+            "analyzed_units": {
+                "rows": 600,
+                "pairs": 300,
+                "cells": 60,
+                "model_task_blocks": 12,
+            },
+            "primary_score_null_pairs": 0,
             "grand_mean_matched": 0.812345,
             "grand_mean_split": 0.543210,
             "grand_mean_gap": 0.269135,
@@ -309,6 +379,14 @@ def _summary_payload() -> dict[str, object]:
             **common,
             "estimand": "equal-cell curves at every locked epsilon",
             "included_units": {"rows": 2400, "cells": 480, "model_task_blocks": 12},
+            "analyzed_units": {
+                "rows": 2400,
+                "paired_units": 1200,
+                "cells": 480,
+                "model_task_blocks": 12,
+            },
+            "score_null_units": 0,
+            "score_null_pairs": 0,
             "curves": curves,
             "large_nonmonotonic_reversals": [],
             "has_large_nonmonotonic_reversals": False,
@@ -397,6 +475,8 @@ def test_manuscript_macros_are_generated_only_from_validated_summary(
     assert r"\newcommand{\SplitCells}{60}" in text
     assert r"\newcommand{\SplitBlocks}{12}" in text
     assert r"\newcommand{\SplitPairs}{300}" in text
+    assert r"\newcommand{\SplitAnalyzedPairs}{300}" in text
+    assert r"\newcommand{\SplitScoreNullPairs}{0}" in text
     assert r"\newcommand{\SplitMatched}{0.812}" in text
     assert r"\newcommand{\SplitCI}{$[0.101, 0.501]$}" in text
     assert r"\newcommand{\ConstructCandidates}{60}" in text
@@ -469,6 +549,35 @@ def test_paper_patch_preserves_bug_macros_and_changes_only_allowlisted_regions(
     assert patched.count("BEGIN POST-RUN ORIENTATION-REDECODABILITY UPDATE") == 1
     assert "\n\\title{Evaluator Reuse Inflates Intervention Scores" in patched
     assert macros.is_file()
+
+
+def test_paper_patch_discloses_denominator_floor_pair_exclusions(
+    tmp_path: Path,
+) -> None:
+    summary = _summary_payload()
+    matched = summary["matched_split"]  # type: ignore[index]
+    matched["analyzed_units"]["rows"] = 598  # type: ignore[index]
+    matched["analyzed_units"]["pairs"] = 299  # type: ignore[index]
+    matched["primary_score_null_pairs"] = 1  # type: ignore[index]
+    epsilon = summary["epsilon_sweep"]  # type: ignore[index]
+    epsilon["analyzed_units"]["rows"] = 2398  # type: ignore[index]
+    epsilon["analyzed_units"]["paired_units"] = 1199  # type: ignore[index]
+    epsilon["score_null_units"] = 1  # type: ignore[index]
+    epsilon["score_null_pairs"] = 1  # type: ignore[index]
+    source = tmp_path / "source.tex"
+    destination = tmp_path / "patched.tex"
+    source.write_text(
+        (PROJECT_ROOT / "main_revised.tex").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    patch_manuscript(source, destination, summary)
+
+    patched = destination.read_text(encoding="utf-8")
+    assert "leaving 299 pairs in the paired estimand" in patched
+    assert "1 denominator-floor pairs remain explicit" in patched
+    assert "1 null score rows across 1 paired epsilon units" in patched
+    assert r"\newcommand{\SplitAnalyzedPairs}{299}" in patched
 
 
 def test_paper_patch_refuses_a_draft_missing_required_markers(tmp_path: Path) -> None:

@@ -5,6 +5,7 @@ import sys
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 import pytest
 import torch
@@ -19,21 +20,115 @@ from src.reviewer_revision.experiments import (
 )
 from src.reviewer_revision.runner import (
     _augment_matched_artifacts,
+    _construct_candidate_device,
     _construct_row_base,
     _environment_report,
     _failure_rows,
+    _hard_failure_mask,
     _main_text_page_count_from_text,
     _materialize_shards,
+    _normalize_score_status,
     _project_disk_usage,
     _project_runtime_from_benchmarks,
     _regenerate_construct_provenance,
     _requires_padding_fix_regeneration,
     _stage_is_complete,
+    _validate_epsilon_baseline_against_matched,
     execute,
     load_pair_checkpoint,
     resolve_resume_directory,
     save_pair_checkpoint,
 )
+
+
+def test_score_floor_status_remains_a_scientific_null_not_a_hard_failure():
+    row = _normalize_score_status(
+        {
+            "status": "pre_target_below_floor",
+            "reason": "pre-edit target accuracy is below floor",
+        }
+    )
+
+    assert row["status"] == "pre_target_below_floor"
+    assert row["score_status"] == "pre_target_below_floor"
+    assert row["failure_stage"] == "scoring"
+    assert row["failure_reason"] == "pre-edit target accuracy is below floor"
+    statuses = pd.DataFrame(
+        [{"status": "ok"}, row, {"status": "failed"}, {"status": "invalid"}]
+    )
+    assert _hard_failure_mask(statuses).tolist() == [False, False, True, True]
+
+
+def test_epsilon_baseline_comparison_accepts_matching_score_nulls():
+    base = {
+        "model_key": "tiny",
+        "task": "toy",
+        "layer": 1,
+        "pair_seed": 0,
+        "method": "fgsm",
+        "condition": "matched",
+        "edit_hash": "same-edit",
+        "status": "pre_target_below_floor",
+        "C": np.nan,
+        "S": np.nan,
+        "H": np.nan,
+        "target_acc_pre": 0.4,
+        "target_acc_post": 0.4,
+        "control_acc_pre": 0.8,
+        "control_acc_post": 0.8,
+    }
+    matched = pd.DataFrame([base])
+    epsilon = pd.DataFrame(
+        [{**base, "epsilon": 0.5, "epsilon_scope": "required_middle"}]
+    )
+
+    report = _validate_epsilon_baseline_against_matched(
+        matched,
+        epsilon,
+        expected_rows=1,
+    )
+
+    assert report["passed"] is True
+    assert report["score_statuses_equal"] is True
+    assert report["maximum_absolute_deviations"]["C"] == 0.0
+
+
+def test_epsilon_baseline_comparison_rejects_asymmetric_score_null():
+    base = {
+        "model_key": "tiny",
+        "task": "toy",
+        "layer": 1,
+        "pair_seed": 0,
+        "method": "fgsm",
+        "condition": "matched",
+        "edit_hash": "same-edit",
+        "status": "pre_target_below_floor",
+        "C": np.nan,
+        "S": np.nan,
+        "H": np.nan,
+        "target_acc_pre": 0.4,
+        "target_acc_post": 0.4,
+        "control_acc_pre": 0.8,
+        "control_acc_post": 0.8,
+    }
+    matched = pd.DataFrame([base])
+    epsilon = pd.DataFrame(
+        [
+            {
+                **base,
+                "epsilon": 0.5,
+                "epsilon_scope": "required_middle",
+                "C": 0.0,
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="null pattern"):
+        _validate_epsilon_baseline_against_matched(
+            matched,
+            epsilon,
+            expected_rows=1,
+        )
 
 
 def _write_construct_provenance_artifacts(tmp_path):
@@ -465,7 +560,23 @@ def test_environment_report_normalizes_project_path_for_psutil(monkeypatch):
 
     assert observed
     assert report["selected_device"] == "cpu"
+    assert report["device_protocol"] == {
+        "transformer_extraction": "cpu",
+        "candidate_mlp_and_jacobian": "cpu",
+        "candidate_linear_and_mka": "cpu",
+        "linear_attackers_and_evaluators": "cpu",
+        "fresh_decoders": "cpu",
+        "statistics": "cpu",
+    }
     assert report["disk_free_bytes"] > 0
+
+
+def test_construct_device_routing_accelerates_only_mlp_candidate_work():
+    requested = torch.device("mps")
+
+    assert _construct_candidate_device("mlp", requested) == requested
+    assert _construct_candidate_device("linear", requested) == torch.device("cpu")
+    assert _construct_candidate_device("mka", requested) == torch.device("cpu")
 
 
 def test_disk_projection_exposes_exact_per_cell_accounting():

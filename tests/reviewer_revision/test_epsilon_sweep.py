@@ -138,6 +138,7 @@ def test_epsilon_half_gate_requires_same_edit_hash_and_metrics_as_experiment_a()
         "method": "fgsm",
         "condition": "matched",
         "edit_hash": "a" * 64,
+        "status": "ok",
         "C": 1.0,
         "S": 0.8,
         "H": 0.888,

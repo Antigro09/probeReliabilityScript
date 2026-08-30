@@ -23,7 +23,12 @@ import numpy as np
 import pandas as pd
 from matplotlib.lines import Line2D
 
-from .analysis import AnalysisValidationError, load_rows
+from .analysis import (
+    HARD_FAILURE_STATUSES,
+    SCORE_NULL_STATUSES,
+    AnalysisValidationError,
+    load_rows,
+)
 
 OKABE_ITO = {
     "orange": "#E69F00",
@@ -132,11 +137,21 @@ def _saved_rows(source: str | Path) -> pd.DataFrame:
         raise FigureValidationError(f"saved row artifact is empty: {path}")
     if "status" not in frame:
         raise FigureValidationError("saved rows require an explicit status column")
-    invalid = frame.loc[frame["status"].astype(str) != "ok"]
-    if not invalid.empty:
+    statuses = frame["status"].astype(str)
+    hard = frame.loc[statuses.isin(HARD_FAILURE_STATUSES)]
+    unknown = frame.loc[~statuses.isin({"ok", *SCORE_NULL_STATUSES})]
+    if not hard.empty or not unknown.empty:
         raise FigureValidationError(
-            f"saved rows include {len(invalid)} non-ok units; figures cannot exclude them"
+            "saved rows include hard or unknown failure statuses; figures cannot "
+            "exclude execution failures"
         )
+    score_nulls = frame.loc[statuses.isin(SCORE_NULL_STATUSES)]
+    if not score_nulls.empty:
+        for column in ("failure_stage", "failure_reason"):
+            if column not in score_nulls or score_nulls[column].fillna("").astype(str).str.strip().eq("").any():
+                raise FigureValidationError(
+                    f"score-null rows require an explicit {column}"
+                )
     return frame
 
 
@@ -194,24 +209,26 @@ def _matched_pair_rows(frame: pd.DataFrame) -> pd.DataFrame:
     missing = [name for name in required if name not in frame]
     if missing:
         raise FigureValidationError(f"matched/split rows lack columns: {missing!r}")
-    primary = frame.loc[frame[method].astype(str).str.lower() == "alterrep"].copy()
-    if primary.empty:
+    primary_requested = frame.loc[
+        frame[method].astype(str).str.lower() == "alterrep"
+    ].copy()
+    if primary_requested.empty:
         raise FigureValidationError("matched/split rows contain no AlterRep units")
     result = pd.DataFrame(
         {
-            "model": primary[model].astype(str),
-            "task": primary[task].astype(str),
-            "layer": primary["layer"].astype(int),
-            "pair_seed": primary["pair_seed"].astype(int),
-            "condition": primary[condition].astype(str).str.lower(),
-            "damage": pd.to_numeric(primary[damage], errors="coerce"),
+            "model": primary_requested[model].astype(str),
+            "task": primary_requested[task].astype(str),
+            "layer": primary_requested["layer"].astype(int),
+            "pair_seed": primary_requested["pair_seed"].astype(int),
+            "condition": primary_requested[condition].astype(str).str.lower(),
+            "damage": pd.to_numeric(primary_requested[damage], errors="coerce"),
+            "status": primary_requested["status"].astype(str),
         }
     )
-    if "depth_position" in primary:
+    if "depth_position" in primary_requested:
         result["depth_position"] = pd.to_numeric(
-            primary["depth_position"], errors="coerce"
+            primary_requested["depth_position"], errors="coerce"
         )
-    _finite_unit_interval(result, ("damage",))
     keys = ["model", "task", "layer", "pair_seed"]
     if result.duplicated([*keys, "condition"]).any():
         raise FigureValidationError("matched/split rows contain duplicate pair conditions")
@@ -223,6 +240,19 @@ def _matched_pair_rows(frame: pd.DataFrame) -> pd.DataFrame:
     )
     if (seed_sets != LOCKED_PAIR_SEEDS).any():
         raise FigureValidationError("every matched/split cell requires pair seeds 0 through 4")
+    complete_mask = result.groupby(keys, sort=False, dropna=False)["status"].transform(
+        lambda values: bool((values.astype(str) == "ok").all())
+    )
+    result = result.loc[complete_mask].copy()
+    if result.empty:
+        raise FigureValidationError("no complete AlterRep pairs remain for plotting")
+    _finite_unit_interval(result, ("damage",))
+    valid_cells = result[["model", "task", "layer"]].drop_duplicates()
+    requested_cells = primary_requested[[model, task, "layer"]].drop_duplicates()
+    if len(valid_cells) != len(requested_cells):
+        raise FigureValidationError(
+            "the locked score floor removed every pair from a requested figure cell"
+        )
     paired = (
         result.set_index([*keys, "condition"])["damage"]
         .unstack("condition")
@@ -489,9 +519,9 @@ def _epsilon_work(frame: pd.DataFrame) -> pd.DataFrame:
             "condition": frame[condition].astype(str).str.lower(),
             "epsilon": pd.to_numeric(frame[epsilon], errors="coerce"),
             "damage": pd.to_numeric(frame[damage], errors="coerce"),
+            "status": frame["status"].astype(str),
         }
     )
-    _finite_unit_interval(work, ("damage",))
     if not np.isfinite(work["epsilon"].to_numpy(dtype=float)).all():
         raise FigureValidationError("epsilon contains non-finite values")
     observed_eps = tuple(sorted(float(value) for value in work["epsilon"].unique()))
@@ -521,6 +551,21 @@ def _epsilon_work(frame: pd.DataFrame) -> pd.DataFrame:
     ].agg(lambda values: frozenset(int(value) for value in values))
     if (seeds != LOCKED_PAIR_SEEDS).any():
         raise FigureValidationError("every epsilon cell requires pair seeds 0 through 4")
+    complete_mask = work.groupby(keys, sort=False, dropna=False)["status"].transform(
+        lambda values: bool((values.astype(str) == "ok").all())
+    )
+    work = work.loc[complete_mask].copy()
+    if work.empty:
+        raise FigureValidationError("no complete epsilon pairs remain for plotting")
+    _finite_unit_interval(work, ("damage",))
+    valid_cells = work[["model", "task", "layer", "method", "epsilon"]].drop_duplicates()
+    requested_cells = frame[
+        [model, task, "layer", method, epsilon]
+    ].drop_duplicates()
+    if len(valid_cells) != len(requested_cells):
+        raise FigureValidationError(
+            "the locked score floor removed every pair from a requested epsilon cell"
+        )
     if work[["model", "task"]].drop_duplicates().shape[0] != 12:
         raise FigureValidationError("epsilon figure requires 12 model-task blocks")
     zero = work.loc[np.isclose(work["epsilon"], 0.0), "damage"].to_numpy(dtype=float)

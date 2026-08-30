@@ -149,6 +149,37 @@ def test_materialize_rows_rejects_mismatched_paired_edit_hashes(tmp_path: Path) 
         )
 
 
+def test_materialize_rows_preserves_paired_score_null_with_same_edit(tmp_path: Path) -> None:
+    rows = pd.DataFrame(
+        [
+            {
+                "unit": "a",
+                "condition": "matched",
+                "edit_hash": "same-edit",
+                "status": "ok",
+            },
+            {
+                "unit": "a",
+                "condition": "split",
+                "edit_hash": "same-edit",
+                "status": "pre_target_below_floor",
+                "failure_stage": "scoring",
+                "failure_reason": "pre-edit target accuracy is below floor",
+            },
+        ]
+    )
+
+    materialized = materialize_rows(
+        rows,
+        csv_path=tmp_path / "rows.csv",
+        parquet_path=tmp_path / "rows.parquet",
+        key_columns=("unit", "condition"),
+    )
+
+    assert len(materialized) == 2
+    assert set(materialized["status"]) == {"ok", "pre_target_below_floor"}
+
+
 def _hierarchical_rows() -> pd.DataFrame:
     records: list[dict[str, object]] = []
     for block in range(12):
@@ -326,6 +357,48 @@ def test_matched_split_summary_does_not_silently_drop_failure_rows() -> None:
         )
 
 
+def test_matched_split_summary_excludes_floor_null_pair_symmetrically() -> None:
+    rows, expected = _matched_split_rows()
+    split_index = rows.index[
+        (rows["model"] == "m0")
+        & (rows["task"] == "t0")
+        & (rows["layer"] == 1)
+        & (rows["pair_seed"] == 0)
+        & (rows["condition"] == "split")
+    ][0]
+    rows.loc[split_index, "target_damage_C"] = np.nan
+    rows.loc[
+        split_index,
+        ["status", "failure_stage", "failure_reason"],
+    ] = [
+        "pre_target_below_floor",
+        "scoring",
+        "pre-edit target accuracy is below floor",
+    ]
+
+    summary = summarize_matched_split(
+        rows,
+        expected_keys=expected,
+        key_columns=(
+            "model",
+            "task",
+            "layer",
+            "pair_seed",
+            "method",
+            "condition",
+        ),
+        expected_blocks=12,
+        bootstrap_draws=50,
+    )
+
+    assert summary["included_units"]["pairs"] == 120
+    assert summary["analyzed_units"]["pairs"] == 119
+    assert summary["included_units"]["cells"] == 24
+    assert summary["primary_score_null_units"] == 1
+    assert summary["primary_score_null_pairs"] == 1
+    assert summary["failed_units"] == 0
+
+
 def test_matched_split_summary_rejects_paired_edit_hash_mismatch() -> None:
     rows, expected = _matched_split_rows()
     split_index = rows.index[rows["condition"] == "split"][0]
@@ -420,8 +493,11 @@ def test_epsilon_summary_reports_full_curve_and_zero_noop() -> None:
     assert len(summary["curves"]) == 12
     assert summary["epsilon_zero_integrity"] == {
         "row_count": 16,
+        "analyzed_damage_row_count": 16,
+        "score_null_row_count": 0,
         "max_abs_target_damage_C": 0.0,
         "max_realized_linf_norm": 0.0,
+        "max_abs_target_accuracy_noop_difference": 0.0,
         "passed": True,
     }
     fgsm_matched = next(
@@ -444,6 +520,47 @@ def test_epsilon_summary_reports_full_curve_and_zero_noop() -> None:
         ("fgsm", "matched", 0.25, 0.5),
         ("pgd", "matched", 0.25, 0.5),
     }
+
+
+def test_epsilon_summary_excludes_floor_null_pair_symmetrically() -> None:
+    rows, expected = _epsilon_rows()
+    split_index = rows.index[
+        (rows["model"] == "m0")
+        & (rows["task"] == "sva")
+        & (rows["pair_seed"] == 0)
+        & (rows["method"] == "fgsm")
+        & np.isclose(rows["epsilon"], 0.25)
+        & (rows["condition"] == "split")
+    ][0]
+    rows.loc[split_index, "target_damage_C"] = np.nan
+    rows.loc[
+        split_index,
+        ["status", "failure_stage", "failure_reason"],
+    ] = [
+        "pre_target_below_floor",
+        "scoring",
+        "pre-edit target accuracy is below floor",
+    ]
+
+    summary = summarize_epsilon_sweep(
+        rows,
+        expected_keys=expected,
+        key_columns=(
+            "model",
+            "task",
+            "layer",
+            "pair_seed",
+            "method",
+            "condition",
+            "epsilon",
+        ),
+    )
+
+    assert summary["included_units"]["rows"] == 48
+    assert summary["analyzed_units"]["rows"] == 46
+    assert summary["score_null_units"] == 1
+    assert summary["score_null_pairs"] == 1
+    assert summary["failed_units"] == 0
 
 
 def test_epsilon_summary_rejects_paired_edit_hash_mismatch() -> None:
