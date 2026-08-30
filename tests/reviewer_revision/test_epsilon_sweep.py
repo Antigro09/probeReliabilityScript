@@ -16,6 +16,7 @@ from src.reviewer_revision.experiments import (
 )
 from src.reviewer_revision.runner import (
     _augment_epsilon_metrics,
+    _summarize_epsilon_half_pattern,
     _validate_epsilon_baseline_against_matched,
 )
 
@@ -139,7 +140,7 @@ def test_epsilon_half_gate_requires_same_edit_hash_and_metrics_as_experiment_a()
         "condition": "matched",
         "edit_hash": "a" * 64,
         "status": "ok",
-        "C": 1.0,
+        "C": 0.8,
         "S": 0.8,
         "H": 0.888,
         "target_acc_pre": 0.9,
@@ -147,7 +148,7 @@ def test_epsilon_half_gate_requires_same_edit_hash_and_metrics_as_experiment_a()
         "control_acc_pre": 0.8,
         "control_acc_post": 0.75,
     }
-    matched = pd.DataFrame([common])
+    matched = pd.DataFrame([common, {**common, "layer": 1}])
     epsilon = pd.DataFrame(
         [{**common, "epsilon": 0.5, "epsilon_scope": "required_middle"}]
     )
@@ -156,6 +157,9 @@ def test_epsilon_half_gate_requires_same_edit_hash_and_metrics_as_experiment_a()
     )
     assert report["passed"] is True
     assert report["rows"] == 1
+    pattern = _summarize_epsilon_half_pattern(epsilon, expected_rows=1)
+    assert pattern["ceiling_rows"] == 0
+    assert pattern["ceiling_fraction_among_defined"] == 0.0
 
     epsilon.loc[0, "edit_hash"] = "b" * 64
     with pytest.raises(ValueError, match="edit hash"):

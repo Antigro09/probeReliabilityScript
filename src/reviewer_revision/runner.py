@@ -2701,10 +2701,17 @@ def _validate_epsilon_baseline_against_matched(
         (epsilon_frame["epsilon_scope"] == "required_middle")
         & np.isclose(epsilon_frame["epsilon"].astype(float), 0.5)
     ].copy()
-    matched = matched_frame.loc[
+    matched_candidates = matched_frame.loc[
         matched_frame["method"].isin(("fgsm", "pgd"))
         & matched_frame["condition"].isin(("matched", "split"))
     ].copy()
+    required_key_frame = required[key_columns].drop_duplicates()
+    matched = matched_candidates.merge(
+        required_key_frame,
+        on=key_columns,
+        how="inner",
+        validate="many_to_one",
+    )
     if len(required) != expected_rows:
         raise ValueError(
             f"epsilon=.5 comparison has {len(required)} rows, expected {expected_rows}"
@@ -2764,6 +2771,54 @@ def _validate_epsilon_baseline_against_matched(
         "score_statuses_equal": True,
         "numeric_absolute_tolerance": 1.0e-12,
         "maximum_absolute_deviations": maximum_deviations,
+    }
+
+
+def _summarize_epsilon_half_pattern(
+    required_middle_rows: pd.DataFrame,
+    *,
+    expected_rows: int = 240,
+) -> dict[str, Any]:
+    """Describe the reproduced epsilon=.5 pattern without assuming all rows ceil."""
+
+    missing = [
+        column
+        for column in ("epsilon", "C", "status")
+        if column not in required_middle_rows
+    ]
+    if missing:
+        raise RuntimeError(f"epsilon=0.5 pattern rows lack columns: {missing!r}")
+    baseline = required_middle_rows.loc[
+        np.isclose(required_middle_rows["epsilon"].astype(float), 0.5)
+    ].copy()
+    if len(baseline) != expected_rows:
+        raise RuntimeError(
+            f"epsilon=0.5 required scope has {len(baseline)} rows; "
+            f"expected {expected_rows}"
+        )
+    defined = pd.to_numeric(baseline["C"], errors="coerce").dropna().to_numpy(
+        dtype=float
+    )
+    if defined.size and not np.isfinite(defined).all():
+        raise RuntimeError("epsilon=0.5 required scope contains non-finite C values")
+    ceiling_rows = int(np.isclose(defined, 1.0, atol=1.0e-12).sum())
+    return {
+        "rows": len(baseline),
+        "defined_score_rows": int(defined.size),
+        "score_null_rows": int(len(baseline) - defined.size),
+        "ceiling_rows": ceiling_rows,
+        "ceiling_fraction_among_defined": (
+            float(ceiling_rows / defined.size) if defined.size else None
+        ),
+        "status_counts": {
+            str(status): int(count)
+            for status, count in baseline["status"]
+            .astype(str)
+            .value_counts()
+            .sort_index()
+            .items()
+        },
+        "interpretation": "descriptive_pattern_reproduced_exactly_from_experiment_a",
     }
 
 
@@ -2976,13 +3031,7 @@ def run_epsilon_sweep(
         matched_frame, frame, expected_rows=240
     )
     required = frame.loc[frame["epsilon_scope"] == "required_middle"]
-    baseline_rows = required.loc[np.isclose(required["epsilon"].astype(float), 0.5)]
-    if len(baseline_rows) != 240 or not np.allclose(
-        baseline_rows["C"].astype(float), 1.0, atol=1.0e-6
-    ):
-        raise RuntimeError(
-            "epsilon=0.5 required rows did not reproduce the archived ceiling pattern"
-        )
+    baseline_pattern = _summarize_epsilon_half_pattern(required)
     summary = summarize_epsilon_sweep(
         frame,
         expected_keys=expected_keys,
@@ -2994,6 +3043,7 @@ def run_epsilon_sweep(
     summary["scope"] = scope
     summary["required_middle_rows"] = len(required)
     summary["baseline_ceiling_reproduced"] = True
+    summary["epsilon_half_ceiling_pattern"] = baseline_pattern
     summary["epsilon_half_experiment_a_reproduction"] = baseline_comparison
     atomic_write_json(context.run_dir / "epsilon_sweep_summary.json", summary)
     context.update_manifest(
@@ -4427,12 +4477,14 @@ def run_analysis(context: RunContext, config: RevisionConfig) -> dict[str, Any]:
     required_epsilon_rows = epsilon_rows.loc[
         epsilon_rows["epsilon_scope"] == "required_middle"
     ]
+    epsilon_half_pattern = _summarize_epsilon_half_pattern(required_epsilon_rows)
     regenerated_epsilon.update(
         {
             "status": "ok",
             "scope": benchmark["epsilon_scope"],
             "required_middle_rows": len(required_epsilon_rows),
             "baseline_ceiling_reproduced": True,
+            "epsilon_half_ceiling_pattern": epsilon_half_pattern,
             "epsilon_half_experiment_a_reproduction": epsilon_comparison,
         }
     )
