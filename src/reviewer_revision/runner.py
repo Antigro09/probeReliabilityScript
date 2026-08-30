@@ -4077,8 +4077,11 @@ def run_construct_check(
                             subset: indices[source_name].tolist()
                             for subset, source_name in edited_subset_names.items()
                         },
-                        "projection_code": "x_post = x - (x @ d) * d; d = d / ||d||_2",
-                        "projection_code_version": "reviewer_revision.rank_one_projection.v1",
+                        "projection_code": (
+                            "float32(x - (x @ d) * d); d = d / ||d||_2; "
+                            "projection and residual accumulated in float64"
+                        ),
+                        "projection_code_version": "reviewer_revision.rank_one_projection.v2",
                         "source_representation_dtype": str(X_direction.dtype),
                         "direction_dtype": str(direction.dtype),
                         "reconstruction_validation": reconstruction_validation,

@@ -44,6 +44,20 @@ def test_rank_one_projection_residual_threshold_is_a_hard_gate():
         rank_one_projection_edit(X, direction, residual_tolerance=0.0)
 
 
+def test_rank_one_projection_uses_stable_arithmetic_before_float32_storage():
+    """Float32 cancellation must not reject a valid high-dimensional edit."""
+
+    generator = torch.Generator().manual_seed(0)
+    X = torch.randn(304, 1536, generator=generator) * 10.0
+    direction = torch.randn(1536, generator=generator)
+
+    edited, diagnostics = rank_one_projection_edit(X, direction)
+
+    assert edited.dtype == torch.float32
+    assert diagnostics["maximum_absolute_residual"] <= 1.0e-5
+    assert diagnostics["residual_gate_passed"] is True
+
+
 def test_linear_jacobian_direction_agrees_with_weight_difference():
     probe = _perfect_linear_probe()
     X = torch.tensor([[-2.0, 0.5], [-1.0, -0.2], [1.0, 0.3], [2.0, -0.4]])

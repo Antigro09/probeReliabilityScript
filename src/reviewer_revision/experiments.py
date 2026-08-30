@@ -327,23 +327,31 @@ def rank_one_projection_edit(
     direction: torch.Tensor,
     *,
     residual_tolerance: float = 1.0e-5,
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, dict[str, Any]]:
     """Project out one normalized direction and report residual diagnostics."""
 
-    vector = direction.detach().cpu().float().flatten()
+    vector = direction.detach().cpu().double().flatten()
     if vector.numel() != X.shape[1]:
         raise ValueError("direction dimension does not match representations")
     norm = float(vector.norm().item())
     if not math.isfinite(norm) or norm <= 1.0e-12:
         raise ValueError("projection direction is degenerate")
     vector = vector / norm
-    X_cpu = X.detach().cpu().float()
-    edited = (X_cpu - (X_cpu @ vector).unsqueeze(1) * vector.unsqueeze(0)).contiguous()
-    residual = edited @ vector
+    X_compute = X.detach().cpu().double()
+    edited = (
+        X_compute - (X_compute @ vector).unsqueeze(1) * vector.unsqueeze(0)
+    ).float().contiguous()
+    # Validate the tensor that is actually persisted, but accumulate the dot
+    # product in float64 so the gate measures projection residual rather than
+    # float32 reduction error in high-dimensional representations.
+    residual = edited.double() @ vector
     maximum_absolute_residual = float(residual.abs().max().item())
     rms_residual = float(residual.square().mean().sqrt().item())
     diagnostics = {
         "input_direction_norm": norm,
+        "projection_compute_dtype": "torch.float64",
+        "projection_storage_dtype": str(edited.dtype),
+        "residual_compute_dtype": "torch.float64",
         "maximum_absolute_residual": maximum_absolute_residual,
         "rms_residual": rms_residual,
         "residual_tolerance": float(residual_tolerance),
