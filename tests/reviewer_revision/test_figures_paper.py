@@ -231,6 +231,33 @@ def test_matched_figure_rows_exclude_both_conditions_of_score_null_pair(
     ).any()
 
 
+def test_matched_figure_rows_keep_requested_nonestimable_cell_explicit(
+    tmp_path: Path,
+) -> None:
+    rows = _matched_rows()
+    affected = (
+        (rows["model"] == "pythia")
+        & (rows["task"] == "sva")
+        & (rows["layer"] == 1)
+        & (rows["condition"] == "split")
+    )
+    rows.loc[affected, "target_damage_C"] = pd.NA
+    rows.loc[affected, "status"] = "pre_target_below_floor"
+    rows.loc[affected, "failure_stage"] = "scoring"
+    rows.loc[affected, "failure_reason"] = "target denominator below floor"
+    path = tmp_path / "matched-null-cell.csv"
+    rows.to_csv(path, index=False)
+
+    paired = _matched_pair_rows(_saved_rows(path))
+
+    assert len(paired) == 295
+    assert paired.attrs["requested_cells"] == 60
+    assert paired.attrs["analyzed_cells"] == 59
+    assert paired.attrs["excluded_cells"] == [
+        {"model": "pythia", "task": "sva", "layer": 1}
+    ]
+
+
 def test_epsilon_figure_rows_exclude_both_conditions_of_score_null_pair(
     tmp_path: Path,
 ) -> None:
@@ -260,6 +287,32 @@ def test_epsilon_figure_rows_exclude_both_conditions_of_score_null_pair(
         & (work["method"] == "fgsm")
         & (work["epsilon"] == 0.25)
     ).any()
+
+
+def test_epsilon_figure_rows_keep_nonestimable_curve_cells_explicit(
+    tmp_path: Path,
+) -> None:
+    rows = _epsilon_rows()
+    affected = (
+        (rows["model"] == "pythia")
+        & (rows["task"] == "sva")
+        & (rows["method"] == "fgsm")
+        & (rows["epsilon"] == 0.25)
+        & (rows["condition"] == "split")
+    )
+    rows.loc[affected, "target_damage_C"] = pd.NA
+    rows.loc[affected, "status"] = "pre_target_below_floor"
+    rows.loc[affected, "failure_stage"] = "scoring"
+    rows.loc[affected, "failure_reason"] = "target denominator below floor"
+    path = tmp_path / "epsilon-null-cell.csv"
+    rows.to_csv(path, index=False)
+
+    work = _epsilon_work(_saved_rows(path))
+
+    assert len(work) == 2_390
+    assert work.attrs["requested_curve_cells"] == 480
+    assert work.attrs["analyzed_curve_cells"] == 478
+    assert len(work.attrs["excluded_curve_cells"]) == 2
 
 
 def test_construct_figure_aligns_sixty_candidate_endpoint_distributions(
@@ -360,6 +413,7 @@ def _summary_payload() -> dict[str, object]:
                 "model_task_blocks": 12,
             },
             "primary_score_null_pairs": 0,
+            "primary_score_null_cells": 0,
             "grand_mean_matched": 0.812345,
             "grand_mean_split": 0.543210,
             "grand_mean_gap": 0.269135,
@@ -387,6 +441,7 @@ def _summary_payload() -> dict[str, object]:
             },
             "score_null_units": 0,
             "score_null_pairs": 0,
+            "score_null_curve_cells": 0,
             "curves": curves,
             "large_nonmonotonic_reversals": [],
             "has_large_nonmonotonic_reversals": False,
@@ -475,6 +530,7 @@ def test_manuscript_macros_are_generated_only_from_validated_summary(
     assert r"\newcommand{\SplitCells}{60}" in text
     assert r"\newcommand{\SplitBlocks}{12}" in text
     assert r"\newcommand{\SplitPairs}{300}" in text
+    assert r"\newcommand{\SplitAnalyzedCells}{60}" in text
     assert r"\newcommand{\SplitAnalyzedPairs}{300}" in text
     assert r"\newcommand{\SplitScoreNullPairs}{0}" in text
     assert r"\newcommand{\SplitMatched}{0.812}" in text
@@ -541,7 +597,10 @@ def test_paper_patch_preserves_bug_macros_and_changes_only_allowlisted_regions(
     assert "figures/fig_circularity_expanded.pdf" in patched
     assert "figures/fig_epsilon_sweep.pdf" in patched
     assert "figures/fig_orientation_redecodability.pdf" in patched
-    assert "60 model--layer--task cells nested in 12 model--task blocks" in patched
+    assert (
+        "60 requested model--layer--task cells (60 analyzable) nested in 12 "
+        "model--task blocks"
+    ) in patched
     assert "one prespecified model--layer--task cell" in patched
     assert "do not establish erasure elsewhere" in patched
     assert "No materiality threshold or inferential recovery rule was predeclared" in patched
@@ -556,14 +615,18 @@ def test_paper_patch_discloses_denominator_floor_pair_exclusions(
 ) -> None:
     summary = _summary_payload()
     matched = summary["matched_split"]  # type: ignore[index]
-    matched["analyzed_units"]["rows"] = 598  # type: ignore[index]
-    matched["analyzed_units"]["pairs"] = 299  # type: ignore[index]
-    matched["primary_score_null_pairs"] = 1  # type: ignore[index]
+    matched["analyzed_units"]["rows"] = 590  # type: ignore[index]
+    matched["analyzed_units"]["pairs"] = 295  # type: ignore[index]
+    matched["analyzed_units"]["cells"] = 59  # type: ignore[index]
+    matched["primary_score_null_pairs"] = 5  # type: ignore[index]
+    matched["primary_score_null_cells"] = 1  # type: ignore[index]
     epsilon = summary["epsilon_sweep"]  # type: ignore[index]
-    epsilon["analyzed_units"]["rows"] = 2398  # type: ignore[index]
-    epsilon["analyzed_units"]["paired_units"] = 1199  # type: ignore[index]
-    epsilon["score_null_units"] = 1  # type: ignore[index]
-    epsilon["score_null_pairs"] = 1  # type: ignore[index]
+    epsilon["analyzed_units"]["rows"] = 2390  # type: ignore[index]
+    epsilon["analyzed_units"]["paired_units"] = 1195  # type: ignore[index]
+    epsilon["analyzed_units"]["cells"] = 478  # type: ignore[index]
+    epsilon["score_null_units"] = 5  # type: ignore[index]
+    epsilon["score_null_pairs"] = 5  # type: ignore[index]
+    epsilon["score_null_curve_cells"] = 2  # type: ignore[index]
     source = tmp_path / "source.tex"
     destination = tmp_path / "patched.tex"
     source.write_text(
@@ -574,10 +637,11 @@ def test_paper_patch_discloses_denominator_floor_pair_exclusions(
     patch_manuscript(source, destination, summary)
 
     patched = destination.read_text(encoding="utf-8")
-    assert "leaving 299 pairs in the paired estimand" in patched
-    assert "1 denominator-floor pairs remain explicit" in patched
-    assert "1 null score rows across 1 paired epsilon units" in patched
-    assert r"\newcommand{\SplitAnalyzedPairs}{299}" in patched
+    assert "leaving 295 pairs and 59 analyzable cells" in patched
+    assert "59 analyzable cells" in patched
+    assert "5 denominator-floor pairs remain explicit" in patched
+    assert "5 null score rows across 5 paired epsilon units" in patched
+    assert r"\newcommand{\SplitAnalyzedPairs}{295}" in patched
 
 
 def test_paper_patch_refuses_a_draft_missing_required_markers(tmp_path: Path) -> None:

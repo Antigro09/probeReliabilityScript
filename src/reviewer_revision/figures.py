@@ -240,6 +240,7 @@ def _matched_pair_rows(frame: pd.DataFrame) -> pd.DataFrame:
     )
     if (seed_sets != LOCKED_PAIR_SEEDS).any():
         raise FigureValidationError("every matched/split cell requires pair seeds 0 through 4")
+    requested_cells = result[["model", "task", "layer"]].drop_duplicates()
     complete_mask = result.groupby(keys, sort=False, dropna=False)["status"].transform(
         lambda values: bool((values.astype(str) == "ok").all())
     )
@@ -248,11 +249,12 @@ def _matched_pair_rows(frame: pd.DataFrame) -> pd.DataFrame:
         raise FigureValidationError("no complete AlterRep pairs remain for plotting")
     _finite_unit_interval(result, ("damage",))
     valid_cells = result[["model", "task", "layer"]].drop_duplicates()
-    requested_cells = primary_requested[[model, task, "layer"]].drop_duplicates()
-    if len(valid_cells) != len(requested_cells):
-        raise FigureValidationError(
-            "the locked score floor removed every pair from a requested figure cell"
-        )
+    valid_cell_keys = set(valid_cells.itertuples(index=False, name=None))
+    excluded_cells = [
+        {"model": key[0], "task": key[1], "layer": int(key[2])}
+        for key in requested_cells.itertuples(index=False, name=None)
+        if tuple(key) not in valid_cell_keys
+    ]
     paired = (
         result.set_index([*keys, "condition"])["damage"]
         .unstack("condition")
@@ -282,6 +284,13 @@ def _matched_pair_rows(frame: pd.DataFrame) -> pd.DataFrame:
             }
             paired.loc[block.index, "depth_position"] = block["layer"].map(layer_order)
     paired["depth_position"] = paired["depth_position"].astype(int)
+    paired.attrs.update(
+        {
+            "requested_cells": len(requested_cells),
+            "analyzed_cells": len(valid_cells),
+            "excluded_cells": excluded_cells,
+        }
+    )
     return paired
 
 
@@ -304,9 +313,9 @@ def _depth_bootstrap(
             group["gap"].to_numpy(dtype=float)
             for _, group in subset.groupby(["model", "task"], sort=True)
         ]
-        if len(groups) != 12:
+        if not groups or len(groups) > 12:
             raise FigureValidationError(
-                f"depth {depth} must contain 12 model-task blocks, observed {len(groups)}"
+                f"depth {depth} has an invalid available-block count: {len(groups)}"
             )
         block_means = np.array([values.mean() for values in groups])
         means.append(float(block_means.mean()))
@@ -338,6 +347,7 @@ def create_expanded_matched_split_figure(
 
     _publication_style()
     paired = _matched_pair_rows(_saved_rows(rows_path))
+    paired_scope = dict(paired.attrs)
     cells = (
         paired.groupby(
             ["model", "task", "layer", "depth_position"],
@@ -347,14 +357,17 @@ def create_expanded_matched_split_figure(
         .mean()
     )
     block_sizes = cells.groupby(["model", "task"])["layer"].nunique()
-    if len(block_sizes) != 12 or block_sizes.nunique() != 1:
+    requested_cell_count = int(paired_scope["requested_cells"])
+    requested_depths_per_block = requested_cell_count // 12
+    if (
+        len(block_sizes) != 12
+        or requested_cell_count not in (36, 60)
+        or (block_sizes > requested_depths_per_block).any()
+        or (block_sizes < 1).any()
+    ):
         raise FigureValidationError(
-            "expanded matched/split figure requires 12 equally sampled model-task blocks"
-        )
-    depths_per_block = int(block_sizes.iloc[0])
-    if depths_per_block not in (3, 5) or len(cells) not in (36, 60):
-        raise FigureValidationError(
-            "expanded matched/split figure requires the locked 60-cell or 36-cell grid"
+            "expanded matched/split figure lost a complete model-task block or "
+            "does not match the locked requested grid"
         )
     if set(cells["model"]) != set(LOCKED_MODELS) or set(cells["task"]) != set(
         LOCKED_TASKS
@@ -426,6 +439,20 @@ def create_expanded_matched_split_figure(
     paired_axis.set_xlabel("Model-task block; sampled layers ordered by depth")
     paired_axis.set_ylim(-0.03, 1.03)
     paired_axis.legend(loc="lower left", ncol=2)
+    if paired_scope["excluded_cells"]:
+        paired_axis.text(
+            0.99,
+            0.02,
+            (
+                f"{len(paired_scope['excluded_cells'])} requested cell "
+                "non-estimable at the locked floor"
+            ),
+            transform=paired_axis.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=6.2,
+            color=OKABE_ITO["gray"],
+        )
     paired_axis.text(
         -0.09,
         1.03,
@@ -481,7 +508,9 @@ def create_expanded_matched_split_figure(
     )
 
     metadata = {
-        "cells": len(cells),
+        "requested_cells": requested_cell_count,
+        "analyzed_cells": len(cells),
+        "excluded_cells": paired_scope["excluded_cells"],
         "model_task_blocks": len(blocks),
         "pair_seeds": 5,
         "depth_positions": depths.tolist(),
@@ -551,6 +580,9 @@ def _epsilon_work(frame: pd.DataFrame) -> pd.DataFrame:
     ].agg(lambda values: frozenset(int(value) for value in values))
     if (seeds != LOCKED_PAIR_SEEDS).any():
         raise FigureValidationError("every epsilon cell requires pair seeds 0 through 4")
+    requested_curve_cells = work[
+        ["model", "task", "layer", "method", "condition", "epsilon"]
+    ].drop_duplicates()
     complete_mask = work.groupby(keys, sort=False, dropna=False)["status"].transform(
         lambda values: bool((values.astype(str) == "ok").all())
     )
@@ -558,19 +590,34 @@ def _epsilon_work(frame: pd.DataFrame) -> pd.DataFrame:
     if work.empty:
         raise FigureValidationError("no complete epsilon pairs remain for plotting")
     _finite_unit_interval(work, ("damage",))
-    valid_cells = work[["model", "task", "layer", "method", "epsilon"]].drop_duplicates()
-    requested_cells = frame[
-        [model, task, "layer", method, epsilon]
+    analyzed_curve_cells = work[
+        ["model", "task", "layer", "method", "condition", "epsilon"]
     ].drop_duplicates()
-    if len(valid_cells) != len(requested_cells):
-        raise FigureValidationError(
-            "the locked score floor removed every pair from a requested epsilon cell"
-        )
+    analyzed_keys = set(analyzed_curve_cells.itertuples(index=False, name=None))
+    excluded_curve_cells = [
+        {
+            "model": key[0],
+            "task": key[1],
+            "layer": int(key[2]),
+            "method": key[3],
+            "condition": key[4],
+            "epsilon": float(key[5]),
+        }
+        for key in requested_curve_cells.itertuples(index=False, name=None)
+        if tuple(key) not in analyzed_keys
+    ]
     if work[["model", "task"]].drop_duplicates().shape[0] != 12:
         raise FigureValidationError("epsilon figure requires 12 model-task blocks")
     zero = work.loc[np.isclose(work["epsilon"], 0.0), "damage"].to_numpy(dtype=float)
     if zero.size == 0 or float(np.max(np.abs(zero))) > 1.0e-6:
         raise FigureValidationError("epsilon zero is not an exact no-op")
+    work.attrs.update(
+        {
+            "requested_curve_cells": len(requested_curve_cells),
+            "analyzed_curve_cells": len(analyzed_curve_cells),
+            "excluded_curve_cells": excluded_curve_cells,
+        }
+    )
     return work
 
 
@@ -614,6 +661,7 @@ def create_epsilon_sweep_figure(
         raise FigureValidationError("bootstrap_draws must be positive")
     _publication_style()
     work = _epsilon_work(_saved_rows(rows_path))
+    work_scope = dict(work.attrs)
     positions, tick_labels = _epsilon_positions()
     figure = plt.figure(figsize=(7.15, 4.35))
     grid = figure.add_gridspec(
@@ -721,6 +769,7 @@ def create_epsilon_sweep_figure(
         "conditions": list(LOCKED_CONDITIONS),
         "model_task_blocks": 12,
         "pair_seeds": 5,
+        **work_scope,
         "includes_ceiling_fraction": True,
         "bootstrap_draws": int(bootstrap_draws),
         "bootstrap_seed": int(bootstrap_seed),

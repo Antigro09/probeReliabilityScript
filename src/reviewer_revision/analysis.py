@@ -794,6 +794,14 @@ def summarize_matched_split(
         .mean()
     )
     requested_cells = primary_requested[cell_columns].drop_duplicates()
+    analyzed_cell_keys = set(
+        cells[cell_columns].itertuples(index=False, name=None)
+    )
+    excluded_cell_keys = [
+        tuple(_python_scalar(value) for value in key)
+        for key in requested_cells.itertuples(index=False, name=None)
+        if tuple(key) not in analyzed_cell_keys
+    ]
     if "depth_position" in primary_requested:
         depth_counts = primary_requested.groupby(cell_columns)["depth_position"].nunique()
         if (depth_counts != 1).any():
@@ -821,11 +829,6 @@ def summarize_matched_split(
             f"matched/split summary expected {expected_blocks} model-task blocks, "
             f"observed {len(blocks)}"
         )
-    if len(cells) != len(requested_cells):
-        raise AnalysisValidationError(
-            "the locked score floor removed every pair from at least one requested cell"
-        )
-
     bootstrap_frame = paired.rename(
         columns={model_col: "model", task_col: "task"}
     )
@@ -851,6 +854,7 @@ def summarize_matched_split(
     cell_signs = _sign_counts(cells["gap"])
     block_signs = _sign_counts(blocks["gap"])
     n_cells = len(cells)
+    n_requested_cells = len(requested_cells)
     n_blocks = len(blocks)
 
     depth_means = {
@@ -941,14 +945,20 @@ def summarize_matched_split(
     summary: dict[str, Any] = {
         "schema_version": 1,
         "estimand": (
-            "For each model-layer-task-pair, target_damage_C_matched minus "
-            "target_damage_C_split on the identical edit; average pairs within "
-            "cell and selected layers within each equally weighted model-task block."
+            "Available-case paired contrast: for every pair with defined matched "
+            "and split target damage, target_damage_C_matched minus "
+            "target_damage_C_split on the identical edit; average complete pairs "
+            "within estimable cells and estimable selected layers within each "
+            "equally weighted model-task block. Requested score-null rows and "
+            "non-estimable cells remain explicit."
+        ),
+        "primary_estimand_status": (
+            "available_case" if excluded_cell_keys else "fully_observed"
         ),
         "included_units": {
             "rows": len(primary_requested),
             "pairs": requested_pair_count,
-            "cells": int(n_cells),
+            "cells": int(n_requested_cells),
             "model_task_blocks": int(n_blocks),
         },
         "analyzed_units": {
@@ -966,10 +976,12 @@ def summarize_matched_split(
         ),
         "primary_score_null_units": len(score_null_primary),
         "primary_score_null_pairs": requested_pair_count - analyzed_pair_count,
+        "primary_score_null_cells": len(excluded_cell_keys),
         "primary_score_null_status_counts": dict(
             Counter(score_null_primary["status"].astype(str))
         ),
         "excluded_primary_pair_keys": excluded_pair_keys,
+        "excluded_primary_cell_keys": excluded_cell_keys,
         "grand_mean_matched": grand_matched,
         "grand_mean_split": grand_split,
         "grand_mean_gap": grand_gap,
@@ -1017,6 +1029,12 @@ def summarize_matched_split(
                         "pairs had a denominator below the locked floor; both "
                         "conditions for each affected pair are excluded from the "
                         "paired estimand and remain explicit in the row artifacts."
+                    ),
+                    (
+                        f"{len(excluded_cell_keys)} of {n_requested_cells} requested "
+                        "cells have no complete pair and are explicitly non-estimable; "
+                        f"the reported available-case summaries use {n_cells} cells "
+                        f"while retaining all {n_blocks} model-task blocks."
                     ),
                     "Fixed-decoder target damage is not evidence of erasure.",
                 )
@@ -1180,10 +1198,24 @@ def summarize_epsilon_sweep(
         .mean()
         .rename(columns={source: canonical for canonical, source in present_metrics.items()})
     )
-    if len(cells) != len(requested_cells):
+    analyzed_curve_cell_keys = set(
+        cells[cell_columns].itertuples(index=False, name=None)
+    )
+    excluded_curve_cell_keys = [
+        tuple(_python_scalar(value) for value in key)
+        for key in requested_cells.itertuples(index=False, name=None)
+        if tuple(key) not in analyzed_curve_cell_keys
+    ]
+    requested_blocks = int(
+        requested_frame[[model_col, task_col]].drop_duplicates().shape[0]
+    )
+    analyzed_blocks = int(
+        frame[[model_col, task_col]].drop_duplicates().shape[0]
+    )
+    if analyzed_blocks != requested_blocks:
         raise AnalysisValidationError(
-            "the locked score floor removed every pair from at least one requested "
-            "epsilon cell"
+            "the locked score floor removed every estimable epsilon unit from a "
+            "requested model-task block"
         )
     curves: list[dict[str, Any]] = []
     for (method, condition, epsilon), group in cells.groupby(
@@ -1302,15 +1334,20 @@ def summarize_epsilon_sweep(
     summary: dict[str, Any] = {
         "schema_version": 1,
         "estimand": (
-            "At every prespecified epsilon, average pair values within each "
-            "model-layer-task cell and then weight cells equally, separately "
-            "for FGSM/PGD and matched/split scoring."
+            "Available-case curves: at every prespecified epsilon, average "
+            "complete-pair values within each estimable model-layer-task cell "
+            "and then weight estimable cells equally, separately for FGSM/PGD "
+            "and matched/split scoring; retain all requested score-null rows and "
+            "non-estimable curve cells explicitly."
+        ),
+        "estimand_status": (
+            "available_case" if excluded_curve_cell_keys else "fully_observed"
         ),
         "included_units": {
             "rows": len(requested_frame),
             "cells": len(requested_cells),
             "model_task_blocks": int(
-                requested_frame[[model_col, task_col]].drop_duplicates().shape[0]
+                requested_blocks
             ),
         },
         "analyzed_units": {
@@ -1318,7 +1355,7 @@ def summarize_epsilon_sweep(
             "paired_units": int(frame[paired_keys].drop_duplicates().shape[0]),
             "cells": len(cells),
             "model_task_blocks": int(
-                frame[[model_col, task_col]].drop_duplicates().shape[0]
+                analyzed_blocks
             ),
         },
         "validated_paired_edit_hashes": int(validated_edit_pairs),
@@ -1328,6 +1365,8 @@ def summarize_epsilon_sweep(
         "score_null_units": len(score_null_rows),
         "score_null_pairs": len(condition_sets)
         - int(frame[paired_keys].drop_duplicates().shape[0]),
+        "score_null_curve_cells": len(excluded_curve_cell_keys),
+        "excluded_curve_cell_keys": excluded_curve_cell_keys,
         "score_null_status_counts": dict(
             Counter(score_null_rows["status"].astype(str))
         ),
@@ -1364,6 +1403,12 @@ def summarize_epsilon_sweep(
                         "paired epsilon units had a denominator below the locked "
                         "floor; both scoring conditions remain explicit and are "
                         "excluded symmetrically from curve estimates."
+                    ),
+                    (
+                        f"{len(excluded_curve_cell_keys)} of {len(requested_cells)} "
+                        "requested method-condition-epsilon curve cells are "
+                        "non-estimable; available-case curves retain all "
+                        f"{analyzed_blocks} model-task blocks."
                     ),
                     "Fixed-decoder target damage is not evidence of erasure.",
                 )

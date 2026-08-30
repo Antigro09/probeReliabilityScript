@@ -399,6 +399,48 @@ def test_matched_split_summary_excludes_floor_null_pair_symmetrically() -> None:
     assert summary["failed_units"] == 0
 
 
+def test_matched_split_summary_reports_nonestimable_score_null_cell() -> None:
+    rows, expected = _matched_split_rows()
+    affected = (
+        (rows["model"] == "m0")
+        & (rows["task"] == "t0")
+        & (rows["layer"] == 1)
+        & (rows["condition"] == "split")
+    )
+    rows.loc[affected, "target_damage_C"] = np.nan
+    rows.loc[
+        affected,
+        ["status", "failure_stage", "failure_reason"],
+    ] = [
+        "pre_target_below_floor",
+        "scoring",
+        "pre-edit target accuracy is below floor",
+    ]
+
+    summary = summarize_matched_split(
+        rows,
+        expected_keys=expected,
+        key_columns=(
+            "model",
+            "task",
+            "layer",
+            "pair_seed",
+            "method",
+            "condition",
+        ),
+        expected_blocks=12,
+        bootstrap_draws=50,
+    )
+
+    assert summary["included_units"]["cells"] == 24
+    assert summary["analyzed_units"]["cells"] == 23
+    assert summary["included_units"]["model_task_blocks"] == 12
+    assert summary["analyzed_units"]["model_task_blocks"] == 12
+    assert summary["primary_score_null_cells"] == 1
+    assert summary["primary_estimand_status"] == "available_case"
+    assert summary["excluded_primary_cell_keys"] == [("m0", "t0", 1)]
+
+
 def test_matched_split_summary_rejects_paired_edit_hash_mismatch() -> None:
     rows, expected = _matched_split_rows()
     split_index = rows.index[rows["condition"] == "split"][0]
@@ -561,6 +603,46 @@ def test_epsilon_summary_excludes_floor_null_pair_symmetrically() -> None:
     assert summary["score_null_units"] == 1
     assert summary["score_null_pairs"] == 1
     assert summary["failed_units"] == 0
+
+
+def test_epsilon_summary_reports_nonestimable_score_null_curve_cells() -> None:
+    rows, expected = _epsilon_rows()
+    affected = (
+        (rows["model"] == "m0")
+        & (rows["task"] == "sva")
+        & (rows["method"] == "fgsm")
+        & np.isclose(rows["epsilon"], 0.25)
+        & (rows["condition"] == "split")
+    )
+    rows.loc[affected, "target_damage_C"] = np.nan
+    rows.loc[
+        affected,
+        ["status", "failure_stage", "failure_reason"],
+    ] = [
+        "pre_target_below_floor",
+        "scoring",
+        "pre-edit target accuracy is below floor",
+    ]
+
+    summary = summarize_epsilon_sweep(
+        rows,
+        expected_keys=expected,
+        key_columns=(
+            "model",
+            "task",
+            "layer",
+            "pair_seed",
+            "method",
+            "condition",
+            "epsilon",
+        ),
+    )
+
+    assert summary["included_units"]["cells"] == 24
+    assert summary["analyzed_units"]["cells"] == 22
+    assert summary["score_null_curve_cells"] == 2
+    assert summary["estimand_status"] == "available_case"
+    assert len(summary["excluded_curve_cell_keys"]) == 2
 
 
 def test_epsilon_summary_rejects_paired_edit_hash_mismatch() -> None:

@@ -126,6 +126,8 @@ def _validate_matched(section: Mapping[str, Any]) -> None:
         raise ManuscriptValidationError("matched_split must contain five pairs per cell")
     analyzed_pairs = analyzed.get("pairs")
     score_null_pairs = section.get("primary_score_null_pairs")
+    analyzed_cells = analyzed.get("cells")
+    score_null_cells = section.get("primary_score_null_cells")
     if (
         not isinstance(analyzed_pairs, int)
         or isinstance(score_null_pairs, bool)
@@ -137,13 +139,25 @@ def _validate_matched(section: Mapping[str, Any]) -> None:
         raise ManuscriptValidationError(
             "matched_split requested, analyzed, and score-null pair counts disagree"
         )
+    if (
+        not isinstance(analyzed_cells, int)
+        or isinstance(score_null_cells, bool)
+        or not isinstance(score_null_cells, int)
+        or analyzed_cells <= 0
+        or score_null_cells < 0
+        or analyzed_cells + score_null_cells != cells
+        or score_null_pairs < 5 * score_null_cells
+    ):
+        raise ManuscriptValidationError(
+            "matched_split requested, analyzed, and score-null cell counts disagree"
+        )
     if analyzed.get("rows") != 2 * analyzed_pairs:
         raise ManuscriptValidationError(
             "matched_split analyzed rows must contain both conditions per analyzed pair"
         )
-    if analyzed.get("cells") != cells or analyzed.get("model_task_blocks") != blocks:
+    if analyzed.get("model_task_blocks") != blocks:
         raise ManuscriptValidationError(
-            "matched_split score-floor exclusions removed a requested cell or block"
+            "matched_split score-floor exclusions removed a requested block"
         )
     matched = _require_number(section, "grand_mean_matched", "matched_split")
     split = _require_number(section, "grand_mean_split", "matched_split")
@@ -192,13 +206,19 @@ def _validate_epsilon(section: Mapping[str, Any]) -> None:
     analyzed = _require_mapping(section, "analyzed_units", "epsilon_sweep")
     score_null_pairs = section.get("score_null_pairs")
     score_null_units = section.get("score_null_units")
+    score_null_curve_cells = section.get("score_null_curve_cells")
     if (
         isinstance(score_null_pairs, bool)
         or not isinstance(score_null_pairs, int)
         or isinstance(score_null_units, bool)
         or not isinstance(score_null_units, int)
+        or isinstance(score_null_curve_cells, bool)
+        or not isinstance(score_null_curve_cells, int)
         or score_null_pairs < 0
         or score_null_units < 0
+        or score_null_curve_cells < 0
+        or score_null_curve_cells % 2 != 0
+        or score_null_pairs < 5 * (score_null_curve_cells // 2)
     ):
         raise ManuscriptValidationError(
             "epsilon_sweep score-null counts must be non-negative integers"
@@ -229,9 +249,17 @@ def _validate_epsilon(section: Mapping[str, Any]) -> None:
         raise ManuscriptValidationError(
             "epsilon_sweep score-null rows exceed their paired exclusions"
         )
-    if analyzed.get("cells") != included.get("cells"):
+    included_cells = included.get("cells")
+    analyzed_cells = analyzed.get("cells")
+    if (
+        not isinstance(included_cells, int)
+        or not isinstance(analyzed_cells, int)
+        or included_cells <= 0
+        or analyzed_cells <= 0
+        or included_cells - analyzed_cells != score_null_curve_cells
+    ):
         raise ManuscriptValidationError(
-            "epsilon_sweep score-floor exclusions removed a requested cell"
+            "epsilon_sweep requested, analyzed, and score-null curve-cell counts disagree"
         )
     zero = _require_mapping(section, "epsilon_zero_integrity", "epsilon_sweep")
     if zero.get("passed") is not True:
@@ -439,6 +467,7 @@ def _macro_lines(summary: Mapping[str, Any]) -> list[str]:
         ("SplitCells", str(included["cells"])),
         ("SplitBlocks", str(included["model_task_blocks"])),
         ("SplitPairs", str(included["pairs"])),
+        ("SplitAnalyzedCells", str(matched["analyzed_units"]["cells"])),
         ("SplitAnalyzedPairs", str(matched["analyzed_units"]["pairs"])),
         ("SplitScoreNullPairs", str(matched["primary_score_null_pairs"])),
         ("SplitMatched", str(manuscript["matched"])),
@@ -536,13 +565,16 @@ def _epsilon_prose(summary: Mapping[str, Any]) -> str:
     reversal_diagnostic = _epsilon_reversal_prose(section)
     score_null_pairs = int(section["score_null_pairs"])
     score_null_units = int(section["score_null_units"])
+    score_null_curve_cells = int(section["score_null_curve_cells"])
     floor_note = ""
     if score_null_pairs:
         floor_note = (
             f" The locked denominator floor produced {score_null_units} null score rows "
             f"across {score_null_pairs} paired epsilon units; both scoring conditions "
             "of every affected unit remain in the row artifact and are excluded "
-            "symmetrically from curve estimates."
+            "symmetrically from curve estimates. This makes "
+            f"{score_null_curve_cells} requested curve cells non-estimable; all "
+            "model--task blocks remain represented."
         )
     return rf"""\paragraph{{Perturbation-budget sweep.}}
 At the archived $\epsilon=0.5$ budget, FGSM has matched and split damage \FGSMArchivedMatched{{}} and \FGSMArchivedSplit{{}}, while PGD has \PGDArchivedMatched{{}} and \PGDArchivedSplit{{}}. {interpretation} {reversal_diagnostic}{floor_note}
@@ -621,8 +653,10 @@ def patch_manuscript(
     cells = int(summary["matched_split"]["included_units"]["cells"])
     blocks = int(summary["matched_split"]["included_units"]["model_task_blocks"])
     pairs = int(summary["matched_split"]["included_units"]["pairs"])
+    analyzed_cells = int(summary["matched_split"]["analyzed_units"]["cells"])
     analyzed_pairs = int(summary["matched_split"]["analyzed_units"]["pairs"])
     score_null_pairs = int(summary["matched_split"]["primary_score_null_pairs"])
+    score_null_cells = int(summary["matched_split"]["primary_score_null_cells"])
     depths = cells // blocks
     matched_floor_note = ""
     matched_result_note = ""
@@ -631,7 +665,9 @@ def patch_manuscript(
             f" The locked denominator floor yielded {score_null_pairs} affected "
             f"pair units; all {pairs} requested pairs remain in the row artifact, "
             f"while both conditions of each affected pair are excluded symmetrically, "
-            f"leaving {analyzed_pairs} pairs in the paired estimand."
+            f"leaving {analyzed_pairs} pairs and {analyzed_cells} analyzable cells in "
+            f"the available-case estimand. {score_null_cells} requested cell is "
+            "explicitly non-estimable."
         )
         matched_result_note = (
             f" The estimate uses {analyzed_pairs} complete pairs; the "
@@ -641,7 +677,8 @@ def patch_manuscript(
     text = _replace_exact(
         text,
         r"over \SplitCells{} model--task cells",
-        f"over {cells} model--layer--task cells nested in {blocks} model--task blocks",
+        f"over {cells} requested model--layer--task cells ({analyzed_cells} "
+        f"analyzable) nested in {blocks} model--task blocks",
         "abstract scope",
     )
     text = _replace_exact(
@@ -653,7 +690,9 @@ def patch_manuscript(
     text = _replace_exact(
         text,
         r"a gap of \SplitGap{} across \SplitCells{} model--task cells.",
-        f"a gap of \\SplitGap{{}} across {cells} model--layer--task cells nested in {blocks} model--task blocks.",
+        f"an available-case gap of \\SplitGap{{}} across {analyzed_cells} "
+        f"analyzable cells from {cells} requested model--layer--task cells nested "
+        f"in {blocks} model--task blocks.",
         "introduction scope",
     )
     text = _replace_exact(
@@ -689,7 +728,8 @@ def patch_manuscript(
         "as a source of measured damage in this pipeline."
     )
     new_result = (
-        f"Across {cells} equally weighted model--layer--task cells, AlterRep mean target "
+        f"Across {analyzed_cells} analyzable, equally weighted model--layer--task cells "
+        f"from {cells} requested cells, AlterRep mean target "
         "damage drops from \\SplitMatched{} to \\SplitIndependent{}. The mean paired gap is "
         "\\SplitGap{}, with a 95\\% hierarchical block-bootstrap interval of \\SplitCI{} and "
         "primary exact two-sided block sign-flip $p=\\SplitP$. Because both conditions score "
@@ -709,8 +749,9 @@ def patch_manuscript(
         "PGD are saturated at the configured perturbation budget. Horizontal marks show grand means.}"
     )
     new_caption = (
-        f"\\caption{{Matched-versus-split AlterRep target damage for {cells} "
-        f"model--layer--task cells nested in {blocks} model--task blocks. Panel A shows "
+        f"\\caption{{Matched-versus-split AlterRep target damage for {analyzed_cells} "
+        f"analyzable cells from {cells} requested model--layer--task cells nested in "
+        f"{blocks} model--task blocks. Panel A shows "
         "paired cell means for the identical edits; the grand matched and split means are "
         "\\SplitMatched{} and \\SplitIndependent{}. Panel B shows all block depth trajectories "
         "and the equal-block mean gap with a 95\\% hierarchical interval. Denominator-floor "
@@ -757,7 +798,8 @@ def patch_manuscript(
         "generates one edit that is hashed and scored unchanged by its matched and split "
         f"evaluators, yielding {pairs} pair units in {cells} cells nested in {blocks} model--task "
         f"blocks. The locked denominator floor excludes both conditions for {score_null_pairs} "
-        f"affected pairs from numerical summaries ({analyzed_pairs} analyzed pairs) while "
+        f"affected pairs from numerical summaries ({analyzed_pairs} analyzed pairs and "
+        f"{analyzed_cells} analyzable cells) while "
         "retaining every requested row and reason in the artifact. We average valid pairs "
         "within cells and layers within equally weighted blocks. The "
         "primary 95\\% interval hierarchically resamples model--task blocks, layers, and pairs; "
