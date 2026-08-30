@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import importlib.metadata
 import json
 import logging
@@ -96,11 +97,18 @@ LOGGER = logging.getLogger("reviewer_revision")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CACHE_ROOT = PROJECT_ROOT / "cache" / "benchmark_v2"
 ARCHIVE_PATH = PROJECT_ROOT / "results" / "ws4" / "attacker_evaluator.json"
+MANUSCRIPT_TEMPLATE_PATH = (
+    PROJECT_ROOT / "assets" / "reviewer_revision" / "main_revised_prepatch.tex"
+)
+MANUSCRIPT_TEMPLATE_TEXT_SHA256 = (
+    "2711f7237be32b4d5cb86d5db02425606988760c8b278009f59e01c2a8a09cf1"
+)
 
 SOURCE_INPUTS = {
     "main_revised.tex": {
         "attachment_name": "1-main_revised.tex",
         "source_sha256": "b51237436cd595ac98a4d818b8eeb720716eb1f569c3fbaf1fd0ad393096ecbe",
+        "repository_path": "assets/reviewer_revision/main_revised_prepatch.tex",
     },
     "revision_experiment_spec.yaml": {
         "attachment_name": "2-revision_experiment_spec.yaml",
@@ -425,7 +433,7 @@ def _environment_report(device: torch.device) -> dict[str, Any]:
 def _input_manifest() -> dict[str, Any]:
     inputs: dict[str, Any] = {}
     for filename, provenance in SOURCE_INPUTS.items():
-        path = PROJECT_ROOT / filename
+        path = PROJECT_ROOT / provenance.get("repository_path", filename)
         inputs[filename] = {
             **provenance,
             "repository_copy_sha256": sha256_file(path),
@@ -4738,6 +4746,25 @@ def _main_text_page_count_from_text(page_texts: Iterable[str]) -> int:
     raise ValueError("compiled manuscript has no identifiable References page")
 
 
+def _pdfinfo_author_is_anonymous(info: str) -> bool:
+    """Accept absent, blank, or explicitly anonymous PDF author metadata."""
+
+    match = re.search(r"^Author:[ \t]*(.*)$", info, flags=re.MULTILINE)
+    if match is None:
+        return True
+    return match.group(1).strip().casefold() in {
+        "",
+        "anonymous author(s)",
+        "anonymous authors",
+    }
+
+
+def _decode_pdftotext_output(output: bytes) -> str:
+    """Decode Poppler text deterministically across Windows code pages."""
+
+    return output.decode("utf-8", errors="replace")
+
+
 def _compile_manuscript(context: RunContext) -> dict[str, Any]:
     command = [
         "latexmk",
@@ -4806,7 +4833,7 @@ def _compile_manuscript(context: RunContext) -> dict[str, Any]:
         check=True,
         timeout=60,
     ).stdout
-    if re.search(r"^Author:\s*(?!Anonymous Authors\s*$).+", info, flags=re.MULTILINE):
+    if not _pdfinfo_author_is_anonymous(info):
         raise RuntimeError("compiled PDF metadata contains a non-anonymous author")
     pages_match = re.search(r"^Pages:\s*(\d+)", info, flags=re.MULTILINE)
     page_count = int(pages_match.group(1)) if pages_match else None
@@ -4826,16 +4853,16 @@ def _compile_manuscript(context: RunContext) -> dict[str, Any]:
                 "-",
             ],
             cwd=PROJECT_ROOT,
-            text=True,
             capture_output=True,
             check=False,
             timeout=60,
         )
         if extraction.returncode != 0:
             raise RuntimeError(
-                f"could not extract PDF page {page_number}: {extraction.stderr}"
+                f"could not extract PDF page {page_number}: "
+                f"{_decode_pdftotext_output(extraction.stderr)}"
             )
-        page_texts.append(extraction.stdout)
+        page_texts.append(_decode_pdftotext_output(extraction.stdout))
     main_text_pages = _main_text_page_count_from_text(page_texts)
     workshop_main_text_limit = 5
     if main_text_pages > workshop_main_text_limit:
@@ -4873,7 +4900,18 @@ def run_patch_paper(context: RunContext, config: RevisionConfig) -> dict[str, An
 
     source_snapshot = context.run_dir / "paper" / "main_revised.prepatch.tex"
     if not source_snapshot.is_file():
-        source_text = (PROJECT_ROOT / "main_revised.tex").read_text(encoding="utf-8")
+        if not MANUSCRIPT_TEMPLATE_PATH.is_file():
+            raise RuntimeError(
+                f"missing locked manuscript template: {MANUSCRIPT_TEMPLATE_PATH}"
+            )
+        source_text = MANUSCRIPT_TEMPLATE_PATH.read_text(encoding="utf-8")
+        template_text_sha256 = hashlib.sha256(source_text.encode()).hexdigest()
+        if template_text_sha256 != MANUSCRIPT_TEMPLATE_TEXT_SHA256:
+            raise RuntimeError(
+                "locked manuscript template text hash mismatch: "
+                f"expected {MANUSCRIPT_TEMPLATE_TEXT_SHA256}, "
+                f"got {template_text_sha256}"
+            )
         atomic_write_via(
             source_snapshot,
             lambda temporary: temporary.write_text(source_text, encoding="utf-8", newline="\n"),

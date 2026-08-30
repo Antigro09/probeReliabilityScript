@@ -26,6 +26,9 @@ from src.reviewer_revision.paper import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PAPER_TEMPLATE = (
+    PROJECT_ROOT / "assets" / "reviewer_revision" / "main_revised_prepatch.tex"
+)
 EPSILONS = (
     0.0,
     0.001953125,
@@ -563,7 +566,7 @@ def test_manuscript_generation_refuses_incomplete_or_unproven_summaries(
 def test_paper_patch_preserves_bug_macros_and_changes_only_allowlisted_regions(
     tmp_path: Path,
 ) -> None:
-    original = (PROJECT_ROOT / "main_revised.tex").read_text(encoding="utf-8")
+    original = PAPER_TEMPLATE.read_text(encoding="utf-8")
     source = tmp_path / "source.tex"
     destination = tmp_path / "patched.tex"
     macros = tmp_path / "manuscript_numbers.tex"
@@ -630,7 +633,7 @@ def test_paper_patch_discloses_denominator_floor_pair_exclusions(
     source = tmp_path / "source.tex"
     destination = tmp_path / "patched.tex"
     source.write_text(
-        (PROJECT_ROOT / "main_revised.tex").read_text(encoding="utf-8"),
+        PAPER_TEMPLATE.read_text(encoding="utf-8"),
         encoding="utf-8",
     )
 

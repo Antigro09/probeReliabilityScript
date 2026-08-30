@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from datetime import datetime, timezone
@@ -19,15 +20,20 @@ from src.reviewer_revision.experiments import (
     train_attacker_evaluator_pair,
 )
 from src.reviewer_revision.runner import (
+    MANUSCRIPT_TEMPLATE_PATH,
+    MANUSCRIPT_TEMPLATE_TEXT_SHA256,
     _augment_matched_artifacts,
     _construct_candidate_device,
     _construct_row_base,
+    _decode_pdftotext_output,
     _environment_report,
     _failure_rows,
     _hard_failure_mask,
+    _input_manifest,
     _main_text_page_count_from_text,
     _materialize_shards,
     _normalize_score_status,
+    _pdfinfo_author_is_anonymous,
     _project_disk_usage,
     _project_runtime_from_benchmarks,
     _regenerate_construct_provenance,
@@ -39,6 +45,27 @@ from src.reviewer_revision.runner import (
     resolve_resume_directory,
     save_pair_checkpoint,
 )
+
+
+def test_locked_manuscript_template_matches_declared_text_hash():
+    template_text = MANUSCRIPT_TEMPLATE_PATH.read_text(encoding="utf-8")
+
+    assert (
+        hashlib.sha256(template_text.encode()).hexdigest()
+        == MANUSCRIPT_TEMPLATE_TEXT_SHA256
+    )
+    assert template_text.endswith("\\end{document}\n")
+
+
+def test_input_manifest_uses_locked_prepatch_manuscript_template():
+    manuscript_input = _input_manifest()["main_revised.tex"]
+
+    assert manuscript_input["repository_path"] == (
+        "assets/reviewer_revision/main_revised_prepatch.tex"
+    )
+    assert manuscript_input["repository_copy_sha256"] == sha256_file(
+        MANUSCRIPT_TEMPLATE_PATH
+    )
 
 
 def test_score_floor_status_remains_a_scientific_null_not_a_hard_failure():
@@ -656,6 +683,30 @@ def test_workshop_main_text_page_count_stops_before_references():
     assert _main_text_page_count_from_text(pages) == 3
     with pytest.raises(ValueError, match="References"):
         _main_text_page_count_from_text(["Title", "Methods"])
+
+
+@pytest.mark.parametrize(
+    ("author_line", "expected"),
+    [
+        ("Author:          ", True),
+        ("Author: Anonymous Authors", True),
+        ("Author: Anonymous Author(s)", True),
+        ("Author: Named Researcher", False),
+    ],
+)
+def test_pdfinfo_author_gate_accepts_blank_or_anonymous_metadata(
+    author_line: str,
+    expected: bool,
+):
+    info = f"Title: Paper\n{author_line}\nPages: 9\n"
+
+    assert _pdfinfo_author_is_anonymous(info) is expected
+
+
+def test_pdftotext_output_is_decoded_as_utf8_not_windows_codepage():
+    encoded = "candidate-conditioned — ε sweep".encode()
+
+    assert _decode_pdftotext_output(encoded) == "candidate-conditioned — ε sweep"
 
 
 def test_only_legacy_left_padding_cache_requires_padding_fix_regeneration():
