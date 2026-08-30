@@ -1472,7 +1472,32 @@ def summarize_construct_check(
     ]
     if "accuracy" not in numeric_columns:
         raise AnalysisValidationError("construct rows require raw accuracy")
-    _require_finite(frame, numeric_columns)
+    ratio_labels = {
+        "target_recovery_ratio": "target",
+        "control_retention_ratio": "control",
+    }
+    shared_numeric_columns = [
+        column for column in numeric_columns if column not in ratio_labels
+    ]
+    _require_finite(frame, shared_numeric_columns)
+    for column, applicable_label in ratio_labels.items():
+        if column not in frame:
+            continue
+        applicable_rows = frame.loc[
+            frame["label"].astype(str) == applicable_label
+        ]
+        if applicable_rows.empty:
+            raise AnalysisValidationError(
+                f"construct rows contain no {applicable_label!r} values for {column!r}"
+            )
+        _require_finite(applicable_rows, (column,))
+
+    def numeric_columns_for_label(label: str) -> list[str]:
+        return [
+            column
+            for column in numeric_columns
+            if column not in ratio_labels or ratio_labels[column] == label
+        ]
 
     aggregate_columns = ["edit_object", "evaluation_family", "label"]
     aggregates: list[dict[str, Any]] = []
@@ -1484,7 +1509,7 @@ def summarize_construct_check(
             "label": str(label),
             "n_rows": len(group),
         }
-        for column in numeric_columns:
+        for column in numeric_columns_for_label(str(label)):
             record[f"mean_{column}"] = float(group[column].mean())
         aggregates.append(record)
 
@@ -1565,7 +1590,7 @@ def summarize_construct_check(
                     "edit_ids": sorted(str(value) for value in group["edit_id"]),
                     "metrics": {
                         column: _distribution_summary(group[column])
-                        for column in numeric_columns
+                        for column in numeric_columns_for_label(str(label))
                     },
                 }
             )

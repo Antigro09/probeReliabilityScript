@@ -755,6 +755,37 @@ def test_construct_summary_covers_every_edit_and_reports_inversion() -> None:
     }
 
 
+def test_construct_summary_validates_only_the_label_applicable_recovery_ratio() -> None:
+    rows, expected = _construct_rows()
+    target = rows["label"] == "target"
+    rows.loc[target, "control_retention_ratio"] = np.nan
+    rows.loc[~target, "target_recovery_ratio"] = np.nan
+
+    summary = summarize_construct_check(
+        rows,
+        expected_keys=expected,
+        key_columns=("edit_id", "evaluation_family", "label"),
+        expected_edit_ids=("edit-0", "edit-1", "edit-2"),
+    )
+
+    for aggregate in summary["aggregates"]:
+        if aggregate["label"] == "target":
+            assert aggregate["mean_target_recovery_ratio"] == pytest.approx(0.70)
+            assert "mean_control_retention_ratio" not in aggregate
+        else:
+            assert aggregate["mean_control_retention_ratio"] == pytest.approx(0.90)
+            assert "mean_target_recovery_ratio" not in aggregate
+
+    rows.loc[rows.index[target][0], "target_recovery_ratio"] = np.nan
+    with pytest.raises(AnalysisValidationError, match="target_recovery_ratio"):
+        summarize_construct_check(
+            rows,
+            expected_keys=expected,
+            key_columns=("edit_id", "evaluation_family", "label"),
+            expected_edit_ids=("edit-0", "edit-1", "edit-2"),
+        )
+
+
 def test_summaries_reject_nonfinite_metrics_instead_of_dropping_them() -> None:
     rows, expected = _epsilon_rows()
     rows.loc[3, "target_damage_C"] = np.nan
