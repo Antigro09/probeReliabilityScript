@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterable, Mapping
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -84,6 +84,7 @@ from .experiments import (
     validate_linf_edit,
     validate_retrained_baseline,
 )
+from .extension_config import ConstructCell
 from .scoring import binary_metrics_from_logits, compute_damage_score
 from .training import (
     DecoderSpec,
@@ -102,6 +103,13 @@ MANUSCRIPT_TEMPLATE_PATH = (
 )
 MANUSCRIPT_TEMPLATE_TEXT_SHA256 = (
     "2711f7237be32b4d5cb86d5db02425606988760c8b278009f59e01c2a8a09cf1"
+)
+
+_PILOT_CONSTRUCT_CELL = ConstructCell(
+    "qwen",
+    "Qwen/Qwen2.5-1.5B",
+    "sst2",
+    14,
 )
 
 SOURCE_INPUTS = {
@@ -3060,6 +3068,154 @@ def run_epsilon_sweep(
     return summary
 
 
+def _construct_cell_record(cell: ConstructCell) -> dict[str, str | int]:
+    return {
+        "model_key": cell.model_key,
+        "model_id": cell.model_id,
+        "task": cell.task,
+        "layer": int(cell.layer),
+    }
+
+
+def construct_artifact_root(run_dir: Path, cell: ConstructCell) -> Path:
+    """Return the collision-free artifact root for one construct cell."""
+
+    return Path(run_dir) / "construct" / "cells" / cell.slug
+
+
+def construct_row_identity(
+    cell: ConstructCell,
+    *,
+    edit_kind: str,
+    architecture: str | None,
+    seed: int,
+) -> dict[str, Any]:
+    """Return the full cell/edit identity persisted on construct rows."""
+
+    return {
+        **_construct_cell_record(cell),
+        "edit_kind": edit_kind,
+        "architecture": architecture,
+        "candidate_seed": int(seed),
+    }
+
+
+@dataclass(frozen=True)
+class _ConstructLayout:
+    artifact_root: Path
+    checkpoint_root: Path
+    array_root: Path
+    rows_csv: Path
+    rows_parquet: Path
+    summary_path: Path
+    shard_experiment: str
+    cell: ConstructCell | None
+    legacy: bool
+
+    def shard_key(self, edit_key: Iterable[Any]) -> tuple[Any, ...]:
+        key = tuple(edit_key)
+        if self.legacy:
+            return key
+        if self.cell is None:  # pragma: no cover - constructor enforces this.
+            raise RuntimeError("generic construct layout is missing its cell")
+        return (
+            self.cell.model_key,
+            self.cell.model_id,
+            self.cell.task,
+            int(self.cell.layer),
+            *key,
+        )
+
+    @property
+    def manifest_key(self) -> str:
+        if self.legacy:
+            return "construct_check"
+        if self.cell is None:  # pragma: no cover - constructor enforces this.
+            raise RuntimeError("generic construct layout is missing its cell")
+        return f"construct_cell.{self.cell.slug}"
+
+    @property
+    def summary_cell(self) -> dict[str, str | int]:
+        if self.cell is None:
+            if self.legacy:
+                return {
+                    "model_key": _PILOT_CONSTRUCT_CELL.model_key,
+                    "task": _PILOT_CONSTRUCT_CELL.task,
+                    "layer": _PILOT_CONSTRUCT_CELL.layer,
+                }
+            raise RuntimeError("generic construct layout is missing its cell")
+        record = _construct_cell_record(self.cell)
+        if self.legacy:
+            record.pop("model_id")
+        return record
+
+
+def _construct_layout(
+    run_dir: Path,
+    cell: ConstructCell | None,
+    *,
+    legacy: bool = False,
+) -> _ConstructLayout:
+    run_dir = Path(run_dir)
+    if legacy:
+        return _ConstructLayout(
+            artifact_root=run_dir / "construct",
+            checkpoint_root=run_dir / "checkpoints" / "construct",
+            array_root=run_dir / "arrays" / "construct",
+            rows_csv=run_dir / "construct_check_rows.csv",
+            rows_parquet=run_dir / "construct_check_rows.parquet",
+            summary_path=run_dir / "construct_check_summary.json",
+            shard_experiment="construct_edits",
+            cell=cell,
+            legacy=True,
+        )
+    if cell is None:
+        raise ValueError("generic construct layout requires a cell")
+    artifact_root = construct_artifact_root(run_dir, cell)
+    return _ConstructLayout(
+        artifact_root=artifact_root,
+        checkpoint_root=(
+            run_dir / "checkpoints" / "construct" / "cells" / cell.slug
+        ),
+        array_root=run_dir / "arrays" / "construct" / "cells" / cell.slug,
+        rows_csv=artifact_root / "construct_check_rows.csv",
+        rows_parquet=artifact_root / "construct_check_rows.parquet",
+        summary_path=artifact_root / "construct_check_summary.json",
+        shard_experiment=f"construct_edits.{cell.slug}",
+        cell=cell,
+        legacy=False,
+    )
+
+
+def _construct_payload(
+    payload: Mapping[str, Any],
+    *,
+    cell: ConstructCell,
+    legacy: bool,
+) -> dict[str, Any]:
+    output = dict(payload)
+    if not legacy:
+        output["cell"] = _construct_cell_record(cell)
+    return output
+
+
+def _validate_construct_cell(config: RevisionConfig, cell: ConstructCell) -> None:
+    if cell.task not in config.tasks:
+        raise ValueError(f"construct cell task is not locked by the base config: {cell.task}")
+    model = config.model(cell.model_key)
+    expected = ConstructCell(
+        model_key=str(model["key"]),
+        model_id=str(model["hf_id"]),
+        task=cell.task,
+        layer=int(model["middle_layer"]),
+    )
+    if cell != expected:
+        raise ValueError(
+            "construct cell must match a locked model/task middle-layer cell: "
+            f"expected={expected}, observed={cell}"
+        )
+
+
 def _construct_model(architecture: str, input_dim: int) -> torch.nn.Module:
     if architecture == "linear":
         return LinearProbe(input_dim)
@@ -3122,16 +3278,18 @@ def _construct_candidate(
     labels: torch.Tensor,
     cache_hash: str,
     device: torch.device,
+    checkpoint_root: Path | None = None,
+    cell_metadata: Mapping[str, Any] | None = None,
 ) -> tuple[torch.nn.Module, str]:
-    path = (
-        context.run_dir / "checkpoints" / "construct" / "candidates"
-        / f"{architecture}-seed{seed}.pt"
-    )
+    root = checkpoint_root or context.run_dir / "checkpoints" / "construct"
+    path = root / "candidates" / f"{architecture}-seed{seed}.pt"
     metadata = {
         "cache_sha256": cache_hash,
         "training_split": "phase2_candidate",
         "repository_seed": 1000 + seed,
     }
+    if cell_metadata is not None:
+        metadata["cell"] = dict(cell_metadata)
     if path.is_file():
         model, checkpoint_hash, _ = _load_named_model(
             path, device=device, expected_metadata=metadata
@@ -3165,18 +3323,20 @@ def _construct_attackers(
     cache_hash: str,
     pair_seeds: Iterable[int],
     device: torch.device,
+    checkpoint_root: Path | None = None,
+    cell_metadata: Mapping[str, Any] | None = None,
 ) -> list[ProbePair]:
+    root = checkpoint_root or context.run_dir / "checkpoints" / "construct"
     pairs: list[ProbePair] = []
     for pair_seed in pair_seeds:
-        path = (
-            context.run_dir / "checkpoints" / "construct" / "attackers"
-            / f"pair{pair_seed}.pt"
-        )
+        path = root / "attackers" / f"pair{pair_seed}.pt"
         metadata = {
             "cache_sha256": cache_hash,
             "training_split": "phase2_candidate",
             "pair_seed": int(pair_seed),
         }
+        if cell_metadata is not None:
+            metadata["cell"] = dict(cell_metadata)
         if path.is_file():
             payload = torch.load(path, map_location="cpu", weights_only=True)
             target, target_hash = _probe_from_state(
@@ -3227,14 +3387,19 @@ def _construct_evaluators(
     ze_evaluator: torch.Tensor,
     cache_hash: str,
     device: torch.device,
+    checkpoint_root: Path | None = None,
+    cell_metadata: Mapping[str, Any] | None = None,
 ):
-    path = context.run_dir / "checkpoints" / "construct" / "evaluators.pt"
+    root = checkpoint_root or context.run_dir / "checkpoints" / "construct"
+    path = root / "evaluators.pt"
     metadata = {
         "cache_sha256": cache_hash,
         "training_split": "phase2_evaluator",
         "n_evaluators": 5,
         "bag_fraction": 0.8,
     }
+    if cell_metadata is not None:
+        metadata["cell"] = dict(cell_metadata)
     if path.is_file():
         payload = torch.load(path, map_location="cpu", weights_only=True)
         if payload.get("metadata") != metadata:
@@ -3392,6 +3557,7 @@ def _construct_row_base(
     *,
     context: RunContext,
     config: RevisionConfig,
+    cell: ConstructCell = _PILOT_CONSTRUCT_CELL,
     edit_id: str,
     edit_kind: str,
     architecture: str,
@@ -3408,10 +3574,7 @@ def _construct_row_base(
         "run_id": context.run_id,
         "git_commit": _current_commit(),
         "config_hash": config.config_hash,
-        "model_key": "qwen",
-        "model_id": "Qwen/Qwen2.5-1.5B",
-        "task": "sst2",
-        "layer": 14,
+        **_construct_cell_record(cell),
         "edit_id": edit_id,
         "edit_object": edit_kind,
         "architecture": architecture,
@@ -3692,25 +3855,32 @@ def _construct_candidate_device(
     )
 
 
-def run_construct_check(
+def _run_construct_cell(
     context: RunContext,
     config: RevisionConfig,
     *,
+    cell: ConstructCell,
     device: torch.device,
+    legacy_layout: bool,
 ) -> dict[str, Any]:
+    _validate_construct_cell(config, cell)
+    layout = _construct_layout(context.run_dir, cell, legacy=legacy_layout)
+    cell_record = _construct_cell_record(cell)
+    scoped_cell_metadata = None if legacy_layout else cell_record
     _require_ok_report(context, "preflight_report.json")
     _require_ok_report(context, "matched_split_summary.json")
-    reconstruction = _reconstruct_tasks(config)["sst2"]
-    model_id = "Qwen/Qwen2.5-1.5B"
+    reconstruction = _reconstruct_tasks(config)[cell.task]
     cache_pins = _preflight_cache_pins(context)
     caches = {
         tag: _load_cache(
-            model_id=model_id,
-            task="sst2",
-            layer=14,
+            model_id=cell.model_id,
+            task=cell.task,
+            layer=cell.layer,
             tag=tag,
             reconstruction=reconstruction,
-            expected_cache_sha256=cache_pins[(model_id, "sst2", 14, tag)],
+            expected_cache_sha256=cache_pins[
+                (cell.model_id, cell.task, cell.layer, tag)
+            ],
         )
         for tag in ("cand", "eval", "inter")
     }
@@ -3719,7 +3889,7 @@ def run_construct_check(
     intervention_cache = caches["inter"]
     mean = candidate_cache.X.float().mean(dim=0, keepdim=True)
     standard_deviation = candidate_cache.X.float().std(dim=0, keepdim=True).clamp_min(1.0e-6)
-    standardization_path = context.run_dir / "construct" / "standardization.pt"
+    standardization_path = layout.artifact_root / "standardization.pt"
     if standardization_path.is_file():
         saved_standardization = torch.load(
             standardization_path, map_location="cpu", weights_only=True
@@ -3731,11 +3901,11 @@ def run_construct_check(
     else:
         atomic_torch_save(
             standardization_path,
-            {
+            _construct_payload({
                 "mean": mean,
                 "standard_deviation": standard_deviation,
                 "candidate_cache_sha256": candidate_cache.selection.cache_sha256,
-            },
+            }, cell=cell, legacy=legacy_layout),
         )
 
     def standardize(X: torch.Tensor) -> torch.Tensor:
@@ -3748,7 +3918,7 @@ def run_construct_check(
     subdivision = subdivide_phase2_intervention(
         reconstruction.folds["intervention"],
         seed=construct_seed,
-        task_name="sst2",
+        task_name=cell.task,
     )
     indices = _subdivision_indices(reconstruction.folds["intervention"], subdivision)
     named_groups = {
@@ -3769,7 +3939,7 @@ def run_construct_check(
         "unused_phase2_test": set(_group_ids(reconstruction, "test")),
     }
     assert_disjoint_named_groups(named_groups)
-    split_payload = {
+    split_payload = _construct_payload({
         "source_data_hash": reconstruction.all_data_hash,
         "phase2_fold_hashes": reconstruction.fold_hashes,
         "phase2_manifest": reconstruction.manifest,
@@ -3778,8 +3948,8 @@ def run_construct_check(
         "intervention_subdivision_diagnostics": subdivision.diagnostics,
         "split_seed": construct_seed,
         "group_disjointness": True,
-    }
-    split_manifest_path = context.run_dir / "construct" / "split_manifest.json"
+    }, cell=cell, legacy=legacy_layout)
+    split_manifest_path = layout.artifact_root / "split_manifest.json"
     _write_immutable_json(split_manifest_path, split_payload)
     split_manifest_ref = _relative(split_manifest_path, context.run_dir)
 
@@ -3856,8 +4026,11 @@ def run_construct_check(
             ),
             "mlp_seeds": [0, 1, 2],
         }
-    hyperparameter_path = context.run_dir / "construct" / "hyperparameter_selection.json"
-    _write_immutable_json(hyperparameter_path, hyperparameters)
+    hyperparameter_path = layout.artifact_root / "hyperparameter_selection.json"
+    _write_immutable_json(
+        hyperparameter_path,
+        _construct_payload(hyperparameters, cell=cell, legacy=legacy_layout),
+    )
 
     mlp_spec = DecoderSpec(
         architecture="mlp",
@@ -3879,7 +4052,7 @@ def run_construct_check(
             per_example_refs = []
             for seed in seeds:
                 metric, checkpoint_hash, history, best_epoch, per_example_path = _fresh_checkpoint(
-                    context.run_dir / "checkpoints" / "construct" / "fresh"
+                    layout.checkpoint_root / "fresh"
                     / "unedited" / f"{family}-{label_name}-seed{seed}.pt",
                     X_train=X_decoder[selection.train_indices],
                     y_train=labels[label_name]["decoder"][selection.train_indices],
@@ -3891,12 +4064,12 @@ def run_construct_check(
                     spec=spec,
                     seed=seed,
                     device=torch.device("cpu"),
-                    metadata={
+                    metadata=_construct_payload({
                         "edit_id": "unedited",
                         "family": family,
                         "label": label_name,
                         "split_hashes": subdivision.subset_hashes,
-                    },
+                    }, cell=cell, legacy=legacy_layout),
                 )
                 records.append({**metric, "best_epoch": best_epoch, "history": history})
                 hashes.append(checkpoint_hash)
@@ -3910,8 +4083,11 @@ def run_construct_check(
                 "per_example_refs": per_example_refs,
                 "seed_records": records,
             }
-    baseline_path = context.run_dir / "construct" / "fresh_decoder_baselines.json"
-    _write_immutable_json(baseline_path, baseline_metrics)
+    baseline_path = layout.artifact_root / "fresh_decoder_baselines.json"
+    _write_immutable_json(
+        baseline_path,
+        _construct_payload(baseline_metrics, cell=cell, legacy=legacy_layout),
+    )
     construct_artifact_provenance = {
         "split_manifest_ref": split_manifest_ref,
         "split_manifest_sha256": sha256_file(split_manifest_path),
@@ -3932,6 +4108,8 @@ def run_construct_check(
         cache_hash=candidate_cache.selection.cache_sha256,
         pair_seeds=config.pair_seeds,
         device=torch.device("cpu"),
+        checkpoint_root=layout.checkpoint_root,
+        cell_metadata=scoped_cell_metadata,
     )
     evaluators = _construct_evaluators(
         context,
@@ -3940,6 +4118,8 @@ def run_construct_check(
         ze_evaluator=labels["control"]["evaluator"],
         cache_hash=evaluator_cache.selection.cache_sha256,
         device=torch.device("cpu"),
+        checkpoint_root=layout.checkpoint_root,
+        cell_metadata=scoped_cell_metadata,
     )
     evaluator_hashes = {
         "target": [state_dict_sha256(_state_payload(evaluator.probes.zc_probe)) for evaluator in evaluators],
@@ -3947,11 +4127,16 @@ def run_construct_check(
     }
 
     edit_keys = config.construct_edit_keys()
-    completed_edits = context.completed_keys("construct_edits", expected_keys=edit_keys)
+    shard_keys = [layout.shard_key(key) for key in edit_keys]
+    completed_edits = context.completed_keys(
+        layout.shard_experiment,
+        expected_keys=shard_keys,
+    )
     fatal_errors: list[str] = []
     for edit_key in edit_keys:
         edit_tuple = tuple(edit_key)
-        if edit_tuple in completed_edits:
+        shard_key = layout.shard_key(edit_tuple)
+        if shard_key in completed_edits:
             continue
         edit_id = _construct_edit_id(*edit_key)
         LOGGER.info("construct check: %s", edit_id)
@@ -3985,7 +4170,7 @@ def run_construct_check(
                         alpha=1.0,
                     ),
                 }
-                recipe_path = context.run_dir / "construct" / "edits" / f"{edit_id}.pt"
+                recipe_path = layout.artifact_root / "edits" / f"{edit_id}.pt"
                 if recipe_path.is_file():
                     saved = torch.load(recipe_path, map_location="cpu", weights_only=True)
                     for subset, value in edited.items():
@@ -3994,12 +4179,12 @@ def run_construct_check(
                 else:
                     atomic_torch_save(
                         recipe_path,
-                        {
+                        _construct_payload({
                             **edited,
                             "source_cache_sha256": intervention_cache.selection.cache_sha256,
                             "dtype": str(X_decoder.dtype),
                             "attacker_checkpoint_hash": candidate_checkpoint_hash,
-                        },
+                        }, cell=cell, legacy=legacy_layout),
                     )
             else:
                 candidate_device = _construct_candidate_device(
@@ -4014,6 +4199,8 @@ def run_construct_check(
                     labels=labels["target"]["candidate"],
                     cache_hash=candidate_cache.selection.cache_sha256,
                     device=candidate_device,
+                    checkpoint_root=layout.checkpoint_root,
+                    cell_metadata=scoped_cell_metadata,
                 )
                 direction, direction_diagnostics = candidate_rank_one_direction(
                     candidate, X_direction, device=candidate_device
@@ -4048,7 +4235,7 @@ def run_construct_check(
                 direction_diagnostics["reconstruction_validation"] = (
                     reconstruction_validation
                 )
-                direction_path = context.run_dir / "construct" / "directions" / f"{edit_id}.pt"
+                direction_path = layout.artifact_root / "directions" / f"{edit_id}.pt"
                 edited_subset_names = {
                     "decoder": "fresh_decoder_fit",
                     "calibration": "orientation_calibration",
@@ -4056,7 +4243,7 @@ def run_construct_check(
                 }
                 _write_immutable_torch(
                     direction_path,
-                    {
+                    _construct_payload({
                         "schema_version": 2,
                         "direction": direction.detach().cpu().float(),
                         "diagnostics": direction_diagnostics,
@@ -4093,7 +4280,7 @@ def run_construct_check(
                         "source_representation_dtype": str(X_direction.dtype),
                         "direction_dtype": str(direction.dtype),
                         "reconstruction_validation": reconstruction_validation,
-                    },
+                    }, cell=cell, legacy=legacy_layout),
                 )
 
             edit_hash = sha256_json(
@@ -4152,8 +4339,10 @@ def run_construct_check(
                         row["example_id"]
                         for row in _subset_manifest_rows(subdivision, "final_test")
                     ]
+                    if not legacy_layout:
+                        result["cell"] = cell_record
                     output_path = (
-                        context.run_dir / "arrays" / "construct" / edit_id
+                        layout.array_root / edit_id
                         / f"evaluator{evaluator_index}-{label_name}.json"
                     )
                     _write_immutable_json(output_path, result)
@@ -4172,6 +4361,7 @@ def run_construct_check(
                         **_construct_row_base(
                             context=context,
                             config=config,
+                            cell=cell,
                             edit_id=edit_id,
                             edit_kind=edit_key.edit_kind,
                             architecture=edit_key.architecture,
@@ -4223,7 +4413,7 @@ def run_construct_check(
                     per_example_refs = []
                     for seed in seeds:
                         checkpoint_path = (
-                            context.run_dir / "checkpoints" / "construct" / "fresh"
+                            layout.checkpoint_root / "fresh"
                             / edit_id / f"{family}-{label_name}-seed{seed}.pt"
                         )
                         metric, checkpoint_hash, history, best_epoch, per_example_path = _fresh_checkpoint(
@@ -4238,14 +4428,14 @@ def run_construct_check(
                             spec=spec,
                             seed=seed,
                             device=torch.device("cpu"),
-                            metadata={
+                            metadata=_construct_payload({
                                 "edit_id": edit_id,
                                 "edit_hash": edit_hash,
                                 "family": family,
                                 "label": label_name,
                                 "split_hashes": subdivision.subset_hashes,
                                 "hyperparameter_selection_sha256": sha256_file(hyperparameter_path),
-                            },
+                            }, cell=cell, legacy=legacy_layout),
                         )
                         metric_records.append({**metric, "best_epoch": best_epoch})
                         checkpoint_hashes.append(checkpoint_hash)
@@ -4253,11 +4443,11 @@ def run_construct_check(
                         curve_path = checkpoint_path.with_suffix(".curve.json")
                         _write_immutable_json(
                             curve_path,
-                            {
+                            _construct_payload({
                                 "history": history,
                                 "best_epoch": best_epoch,
                                 "checkpoint_sha256": checkpoint_hash,
-                            },
+                            }, cell=cell, legacy=legacy_layout),
                         )
                         curve_refs.append(_relative(curve_path, context.run_dir))
                     metrics = {
@@ -4274,6 +4464,7 @@ def run_construct_check(
                             **_construct_row_base(
                                 context=context,
                                 config=config,
+                                cell=cell,
                                 edit_id=edit_id,
                                 edit_kind=edit_key.edit_kind,
                                 architecture=edit_key.architecture,
@@ -4312,17 +4503,17 @@ def run_construct_check(
                         }
                     )
             context.write_json_shard(
-                "construct_edits",
-                edit_tuple,
-                {
+                layout.shard_experiment,
+                shard_key,
+                _construct_payload({
                     "status": "ok",
                     "edit_id": edit_id,
                     "edit_hash": edit_hash,
                     "rows": rows,
                     "direction_diagnostics": direction_diagnostics,
-                },
+                }, cell=cell, legacy=legacy_layout),
             )
-            completed_edits.add(edit_tuple)
+            completed_edits.add(shard_key)
         except Exception as error:  # noqa: BLE001 - persist explicit edit failure
             fatal_errors.append(f"{edit_id}: {type(error).__name__}: {error}")
             failure_rows = []
@@ -4333,6 +4524,7 @@ def run_construct_check(
                             **_construct_row_base(
                                 context=context,
                                 config=config,
+                                cell=cell,
                                 edit_id=edit_id,
                                 edit_kind=edit_key.edit_kind,
                                 architecture=edit_key.architecture,
@@ -4355,33 +4547,36 @@ def run_construct_check(
                         }
                     )
             context.write_json_shard(
-                "construct_edits",
-                edit_tuple,
-                {
+                layout.shard_experiment,
+                shard_key,
+                _construct_payload({
                     "status": "failed",
                     "edit_id": edit_id,
                     "edit_hash": None,
                     "rows": failure_rows,
                     "failure_stage": "construct_edit_or_evaluation",
                     "failure_reason": f"{type(error).__name__}: {error}",
-                },
+                }, cell=cell, legacy=legacy_layout),
             )
             # Materialize the explicit failure rows for this invocation.
             # Resume excludes this top-level failed payload and retries it.
-            completed_edits.add(edit_tuple)
+            completed_edits.add(shard_key)
 
-    if completed_edits != {tuple(key) for key in edit_keys}:
+    if completed_edits != set(shard_keys):
         raise RuntimeError("construct check edit shards are incomplete")
     construct_rows = []
     for edit_key in edit_keys:
         construct_rows.extend(
-            context.load_json_shard("construct_edits", edit_key)["rows"]
+            context.load_json_shard(
+                layout.shard_experiment,
+                layout.shard_key(edit_key),
+            )["rows"]
         )
     expected_row_keys = _construct_expected_keys(config)
     frame = materialize_rows(
         construct_rows,
-        csv_path=context.run_dir / "construct_check_rows.csv",
-        parquet_path=context.run_dir / "construct_check_rows.parquet",
+        csv_path=layout.rows_csv,
+        parquet_path=layout.rows_parquet,
         key_columns=("edit_id", "evaluation_family", "label"),
     )
     observed_keys = {
@@ -4392,7 +4587,7 @@ def run_construct_check(
         raise RuntimeError("construct check exact row-key coverage failed")
     if fatal_errors or (frame["status"] == "failed").any():
         context.update_manifest(
-            {"construct_check": {"status": "failed", "errors": fatal_errors[:20]}}
+            {layout.manifest_key: {"status": "failed", "errors": fatal_errors[:20]}}
         )
         raise RuntimeError(f"construct check contains {len(fatal_errors)} failed edits")
     construct_provenance = _regenerate_construct_provenance(context, frame)
@@ -4402,13 +4597,13 @@ def run_construct_check(
         expected_keys=expected_row_keys,
         key_columns=("edit_id", "evaluation_family", "label"),
         expected_edit_ids=expected_edit_ids,
-        raw_row_file_sha256=sha256_file(context.run_dir / "construct_check_rows.parquet"),
+        raw_row_file_sha256=sha256_file(layout.rows_parquet),
         generating_git_commit=_current_commit(),
     )
     summary["status"] = "ok"
     summary.update(
         {
-            "cell": {"model_key": "qwen", "task": "sst2", "layer": 14},
+            "cell": layout.summary_cell,
             "confidence_interval_method": "descriptive full distributions across prespecified edits",
             "cluster_unit": "candidate_edit_with_five_evaluator_bags",
             "bootstrap_seed": int(config.raw["reproducibility"]["bootstrap_seed"]),
@@ -4417,11 +4612,52 @@ def run_construct_check(
             **construct_provenance,
         }
     )
-    atomic_write_json(context.run_dir / "construct_check_summary.json", summary)
+    atomic_write_json(layout.summary_path, summary)
     context.update_manifest(
-        {"construct_check": {"status": "ok", "edits": len(edit_keys), "rows": len(frame)}}
+        {
+            layout.manifest_key: {
+                "status": "ok",
+                "edits": len(edit_keys),
+                "rows": len(frame),
+            }
+        }
     )
     return summary
+
+
+def run_construct_cell(
+    context: RunContext,
+    config: RevisionConfig,
+    *,
+    cell: ConstructCell,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Run one namespaced middle-layer construct cell."""
+
+    return _run_construct_cell(
+        context,
+        config,
+        cell=cell,
+        device=device,
+        legacy_layout=False,
+    )
+
+
+def run_construct_check(
+    context: RunContext,
+    config: RevisionConfig,
+    *,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Run the original Qwen/SST-2 pilot with its legacy artifact contract."""
+
+    return _run_construct_cell(
+        context,
+        config,
+        cell=_PILOT_CONSTRUCT_CELL,
+        device=device,
+        legacy_layout=True,
+    )
 
 
 def run_analysis(context: RunContext, config: RevisionConfig) -> dict[str, Any]:
