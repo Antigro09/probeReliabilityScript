@@ -50,12 +50,29 @@ _LOCKED_THRESHOLDS = {
     "target_recovery_ratio": 0.50,
     "control_retention_ratio": 0.80,
 }
-_LOCKED_BASE_RUN = (
-    "results/reviewer_revision_2026_08/20260830T024520Z-7aab3eb"
-)
+_LOCKED_BASE_RUN = "results/reviewer_revision_2026_08/20260830T024520Z-7aab3eb"
 _LOCKED_OUTPUT_ROOT = "results/reviewer_caveat_extension_2026_08"
 _LOCKED_BOOTSTRAP_DRAWS = 10_000
 _LOCKED_BOOTSTRAP_SEED = 20260830
+_LOCKED_AMENDMENT_DATE = "2026-08-31"
+_LOCKED_AMENDMENT_TIMING = "before_any_confirmatory_endpoint_computation"
+_LOCKED_AMENDMENT_NOTE = (
+    "Locks the exact random-number generator, quantile and tail conventions, "
+    "cell-level intersection-union test, Holm decision rule, nonestimable-cell "
+    "handling, pilot treatment, and honest marginal-bound labels."
+)
+_LOCKED_ALPHA = 0.05
+_LOCKED_BOOTSTRAP_BIT_GENERATOR = "PCG64"
+_LOCKED_BOOTSTRAP_QUANTILE_METHOD = "linear"
+_LOCKED_ALTERNATIVE = "one_sided"
+_LOCKED_ENDPOINT_TAIL_P_VALUE = "(1 + count(theta_star <= threshold)) / (B + 1)"
+_LOCKED_WITHIN_CELL_COMBINATION = "intersection_union_max_endpoint_p"
+_LOCKED_MULTIPLICITY = "holm"
+_LOCKED_FAMILY_SIZE = 11
+_LOCKED_NONESTIMABLE_LABEL = "nonestimable"
+_LOCKED_PILOT_MODE = "descriptive_only"
+_LOCKED_LOWER_BOUND_CONFIDENCE_LEVEL = 0.95
+_LOCKED_LOWER_BOUND_SCOPE = "marginal"
 _LOCKED_DISK_RESERVE_GIB = 8.0
 _SLUG_TOKEN = re.compile(r"[a-z0-9][a-z0-9_-]*\Z")
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
@@ -72,6 +89,30 @@ class ExtensionConfig:
     recovery_thresholds: Mapping[str, float]
     bootstrap_draws: int
     bootstrap_seed: int
+    prospective_amendment_date: str
+    prospective_amendment_timing: str
+    prospective_amendment_note: str
+    alpha: float
+    bootstrap_bit_generator: str
+    bootstrap_quantile_method: str
+    alternative: str
+    endpoint_tail_p_value: str
+    within_cell_combination: str
+    multiplicity: str
+    family_size: int
+    decision_requires_all_point_thresholds: bool
+    decision_requires_holm_adjusted_cell_p_at_most_alpha: bool
+    decision_reports_separate_booleans: bool
+    nonestimable_preserves_family_membership: bool
+    nonestimable_internal_cell_p_value: float
+    nonestimable_label: str
+    pilot_mode: str
+    pilot_compute_confirmatory_p_value: bool
+    pilot_compute_confirmatory_decision: bool
+    lower_bound_confidence_level: float
+    lower_bound_scope: str
+    lower_bound_multiplicity_adjusted: bool
+    lower_bound_simultaneous: bool
     disk_reserve_gib: float
 
     def __post_init__(self) -> None:
@@ -107,6 +148,52 @@ class ExtensionConfig:
             "recovery_thresholds": dict(self.recovery_thresholds),
             "bootstrap_draws": self.bootstrap_draws,
             "bootstrap_seed": self.bootstrap_seed,
+            "prospective_amendment": {
+                "date": self.prospective_amendment_date,
+                "timing": self.prospective_amendment_timing,
+                "note": self.prospective_amendment_note,
+            },
+            "alpha": self.alpha,
+            "bootstrap_bit_generator": self.bootstrap_bit_generator,
+            "bootstrap_quantile_method": self.bootstrap_quantile_method,
+            "alternative": self.alternative,
+            "endpoint_tail_p_value": self.endpoint_tail_p_value,
+            "within_cell_combination": self.within_cell_combination,
+            "multiplicity": self.multiplicity,
+            "family_size": self.family_size,
+            "decision": {
+                "requires_all_point_thresholds": (
+                    self.decision_requires_all_point_thresholds
+                ),
+                "requires_holm_adjusted_cell_p_at_most_alpha": (
+                    self.decision_requires_holm_adjusted_cell_p_at_most_alpha
+                ),
+                "reports_point_and_inferential_booleans_separately": (
+                    self.decision_reports_separate_booleans
+                ),
+            },
+            "nonestimable": {
+                "preserves_family_membership": (
+                    self.nonestimable_preserves_family_membership
+                ),
+                "internal_cell_p_value": self.nonestimable_internal_cell_p_value,
+                "label": self.nonestimable_label,
+            },
+            "pilot_inference": {
+                "mode": self.pilot_mode,
+                "compute_confirmatory_p_value": (
+                    self.pilot_compute_confirmatory_p_value
+                ),
+                "compute_confirmatory_decision": (
+                    self.pilot_compute_confirmatory_decision
+                ),
+            },
+            "lower_bound": {
+                "confidence_level": self.lower_bound_confidence_level,
+                "scope": self.lower_bound_scope,
+                "multiplicity_adjusted": self.lower_bound_multiplicity_adjusted,
+                "simultaneous": self.lower_bound_simultaneous,
+            },
             "disk_reserve_gib": self.disk_reserve_gib,
         }
 
@@ -123,9 +210,7 @@ class ExtensionConfig:
             raise ExtensionConfigError("base_run differs from the locked immutable run")
         if not isinstance(self.pilot, ConstructCell):
             raise ExtensionConfigError("pilot must be a ConstructCell")
-        if any(
-            not isinstance(cell, ConstructCell) for cell in self.confirmatory_cells
-        ):
+        if any(not isinstance(cell, ConstructCell) for cell in self.confirmatory_cells):
             raise ExtensionConfigError(
                 "confirmatory cells must be ConstructCell values"
             )
@@ -188,6 +273,141 @@ class ExtensionConfig:
             raise ExtensionConfigError("bootstrap seed must be an integer")
         if self.bootstrap_seed != _LOCKED_BOOTSTRAP_SEED:
             raise ExtensionConfigError("bootstrap seed differs from the locked design")
+        _locked_scalar(
+            self.prospective_amendment_date,
+            _LOCKED_AMENDMENT_DATE,
+            "prospective_amendment.date",
+        )
+        _locked_scalar(
+            self.prospective_amendment_timing,
+            _LOCKED_AMENDMENT_TIMING,
+            "prospective_amendment.timing",
+            label="before any confirmatory endpoint computation",
+        )
+        _locked_scalar(
+            self.prospective_amendment_note,
+            _LOCKED_AMENDMENT_NOTE,
+            "prospective_amendment.note",
+            label="the locked prospective-amendment note",
+        )
+        _locked_scalar(self.alpha, _LOCKED_ALPHA, "inference.alpha")
+        _locked_scalar(
+            self.bootstrap_bit_generator,
+            _LOCKED_BOOTSTRAP_BIT_GENERATOR,
+            "inference.bootstrap.bit_generator",
+        )
+        _locked_scalar(
+            self.bootstrap_quantile_method,
+            _LOCKED_BOOTSTRAP_QUANTILE_METHOD,
+            "inference.bootstrap.quantile_method",
+        )
+        _locked_scalar(
+            self.alternative,
+            _LOCKED_ALTERNATIVE,
+            "inference.alternative",
+            label="one_sided inference",
+        )
+        _locked_scalar(
+            self.endpoint_tail_p_value,
+            _LOCKED_ENDPOINT_TAIL_P_VALUE,
+            "inference.endpoint_tail_p_value",
+            label="the locked plus-one endpoint tail p-value formula",
+        )
+        _locked_scalar(
+            self.within_cell_combination,
+            _LOCKED_WITHIN_CELL_COMBINATION,
+            "inference.within_cell_combination",
+            label="the intersection-union maximum endpoint p-value rule",
+        )
+        _locked_scalar(
+            self.multiplicity,
+            _LOCKED_MULTIPLICITY,
+            "inference.multiplicity",
+            label="Holm adjustment",
+        )
+        _locked_scalar(
+            self.family_size,
+            _LOCKED_FAMILY_SIZE,
+            "inference.family_size",
+            label="exactly 11 confirmatory cells",
+        )
+        _locked_scalar(
+            self.decision_requires_all_point_thresholds,
+            True,
+            "inference.decision.requires_all_point_thresholds",
+            label="true so all point thresholds are required",
+        )
+        _locked_scalar(
+            self.decision_requires_holm_adjusted_cell_p_at_most_alpha,
+            True,
+            "inference.decision.requires_holm_adjusted_cell_p_at_most_alpha",
+            label="true so the Holm-adjusted cell p-value must be at most alpha",
+        )
+        _locked_scalar(
+            self.decision_reports_separate_booleans,
+            True,
+            "inference.decision.reports_point_and_inferential_booleans_separately",
+            label="true so point and inferential booleans are reported separately",
+        )
+        _locked_scalar(
+            self.nonestimable_preserves_family_membership,
+            True,
+            "inference.nonestimable.preserves_family_membership",
+            label="true to preserve family membership",
+        )
+        _locked_scalar(
+            self.nonestimable_internal_cell_p_value,
+            1.0,
+            "inference.nonestimable.internal_cell_p_value",
+            label="the conservative internal p-value 1.0",
+        )
+        _locked_scalar(
+            self.nonestimable_label,
+            _LOCKED_NONESTIMABLE_LABEL,
+            "inference.nonestimable.label",
+        )
+        _locked_scalar(
+            self.pilot_mode,
+            _LOCKED_PILOT_MODE,
+            "inference.pilot.mode",
+            label="descriptive_only",
+        )
+        _locked_scalar(
+            self.pilot_compute_confirmatory_p_value,
+            False,
+            "inference.pilot.compute_confirmatory_p_value",
+            label="false: no pilot confirmatory p-value",
+        )
+        _locked_scalar(
+            self.pilot_compute_confirmatory_decision,
+            False,
+            "inference.pilot.compute_confirmatory_decision",
+            label="false: no pilot confirmatory decision",
+        )
+        _locked_scalar(
+            self.lower_bound_confidence_level,
+            _LOCKED_LOWER_BOUND_CONFIDENCE_LEVEL,
+            "inference.lower_bound.confidence_level",
+            label="0.95 for a one-sided 95% lower bound",
+        )
+        _locked_scalar(
+            self.lower_bound_scope,
+            _LOCKED_LOWER_BOUND_SCOPE,
+            "inference.lower_bound.scope",
+            label="marginal",
+        )
+        _locked_scalar(
+            self.lower_bound_multiplicity_adjusted,
+            False,
+            "inference.lower_bound.multiplicity_adjusted",
+            label="false: bounds are not multiplicity-adjusted",
+        )
+        _locked_scalar(
+            self.lower_bound_simultaneous,
+            False,
+            "inference.lower_bound.simultaneous",
+            label="false: bounds are not simultaneous",
+        )
         if type(self.disk_reserve_gib) is not float or not math.isfinite(
             self.disk_reserve_gib
         ):
@@ -209,9 +429,7 @@ def _construct_unique_mapping(
         try:
             duplicate = key in mapping
         except TypeError as exc:
-            raise ExtensionConfigError(
-                f"unhashable YAML mapping key: {key!r}"
-            ) from exc
+            raise ExtensionConfigError(f"unhashable YAML mapping key: {key!r}") from exc
         if duplicate:
             raise ExtensionConfigError(f"duplicate YAML mapping key: {key}")
         mapping[key] = loader.construct_object(value_node, deep=deep)
@@ -231,9 +449,7 @@ def _require_exact_keys(
     unexpected = actual - expected
     if missing:
         names = ", ".join(sorted(missing))
-        raise ExtensionConfigError(
-            f"{location} is missing required fields: {names}"
-        )
+        raise ExtensionConfigError(f"{location} is missing required fields: {names}")
     if unexpected:
         names = ", ".join(sorted(repr(key) for key in unexpected))
         raise ExtensionConfigError(f"{location} has unexpected fields: {names}")
@@ -294,9 +510,7 @@ def _cell_from_raw(value: Any, location: str) -> ConstructCell:
 
 
 def _validate_cell_value(cell: ConstructCell, location: str) -> None:
-    if not isinstance(cell.model_key, str) or not _SLUG_TOKEN.fullmatch(
-        cell.model_key
-    ):
+    if not isinstance(cell.model_key, str) or not _SLUG_TOKEN.fullmatch(cell.model_key):
         raise ExtensionConfigError(f"{location}.model_key must be path-safe")
     if not isinstance(cell.task, str) or not _SLUG_TOKEN.fullmatch(cell.task):
         raise ExtensionConfigError(f"{location}.task must be path-safe")
@@ -319,6 +533,7 @@ def _validated_payload(raw: dict[Any, Any]) -> dict[str, Any]:
         "schema_version",
         "run_name",
         "purpose",
+        "prospective_amendment",
         "base_run",
         "construct_panel",
         "inference",
@@ -334,6 +549,30 @@ def _validated_payload(raw: dict[Any, Any]) -> dict[str, Any]:
     )
     if not isinstance(raw["purpose"], str) or not raw["purpose"].strip():
         raise ExtensionConfigError("purpose must be a non-empty string")
+
+    amendment = _mapping(raw["prospective_amendment"], "prospective_amendment")
+    _require_exact_keys(
+        amendment,
+        {"date", "timing", "note"},
+        "prospective_amendment",
+    )
+    _locked_scalar(
+        amendment["date"],
+        _LOCKED_AMENDMENT_DATE,
+        "prospective_amendment.date",
+    )
+    _locked_scalar(
+        amendment["timing"],
+        _LOCKED_AMENDMENT_TIMING,
+        "prospective_amendment.timing",
+        label="before any confirmatory endpoint computation",
+    )
+    _locked_scalar(
+        amendment["note"],
+        _LOCKED_AMENDMENT_NOTE,
+        "prospective_amendment.note",
+        label="the locked prospective-amendment note",
+    )
 
     base_run_text, base_run = _portable_relative_path(raw["base_run"], "base_run")
     if base_run_text != _LOCKED_BASE_RUN:
@@ -373,15 +612,30 @@ def _validated_payload(raw: dict[Any, Any]) -> dict[str, Any]:
     inference = _mapping(raw["inference"], "inference")
     _require_exact_keys(
         inference,
-        {"bootstrap", "alternative", "multiplicity", "family_size"},
+        {
+            "alpha",
+            "bootstrap",
+            "alternative",
+            "endpoint_tail_p_value",
+            "within_cell_combination",
+            "multiplicity",
+            "family_size",
+            "decision",
+            "nonestimable",
+            "pilot",
+            "lower_bound",
+        },
         "inference",
     )
+    _locked_scalar(inference["alpha"], _LOCKED_ALPHA, "inference.alpha")
     bootstrap = _mapping(inference["bootstrap"], "inference.bootstrap")
     _require_exact_keys(
         bootstrap,
         {
             "draws",
             "seed",
+            "bit_generator",
+            "quantile_method",
             "resampling_unit",
             "shared_resamples_across_models_within_task",
         },
@@ -390,13 +644,21 @@ def _validated_payload(raw: dict[Any, Any]) -> dict[str, Any]:
     if type(bootstrap["draws"]) is not int:
         raise ExtensionConfigError("inference.bootstrap.draws must be an integer")
     if bootstrap["draws"] != _LOCKED_BOOTSTRAP_DRAWS:
-        raise ExtensionConfigError(
-            "inference.bootstrap.draws must be exactly 10,000"
-        )
+        raise ExtensionConfigError("inference.bootstrap.draws must be exactly 10,000")
     _locked_scalar(
         bootstrap["seed"],
         _LOCKED_BOOTSTRAP_SEED,
         "inference.bootstrap.seed",
+    )
+    _locked_scalar(
+        bootstrap["bit_generator"],
+        _LOCKED_BOOTSTRAP_BIT_GENERATOR,
+        "inference.bootstrap.bit_generator",
+    )
+    _locked_scalar(
+        bootstrap["quantile_method"],
+        _LOCKED_BOOTSTRAP_QUANTILE_METHOD,
+        "inference.bootstrap.quantile_method",
     )
     _locked_scalar(
         bootstrap["resampling_unit"],
@@ -410,17 +672,143 @@ def _validated_payload(raw: dict[Any, Any]) -> dict[str, Any]:
     )
     _locked_scalar(
         inference["alternative"],
-        "one_sided",
+        _LOCKED_ALTERNATIVE,
         "inference.alternative",
         label="one_sided inference",
     )
     _locked_scalar(
+        inference["endpoint_tail_p_value"],
+        _LOCKED_ENDPOINT_TAIL_P_VALUE,
+        "inference.endpoint_tail_p_value",
+        label="the locked plus-one endpoint tail p-value formula",
+    )
+    _locked_scalar(
+        inference["within_cell_combination"],
+        _LOCKED_WITHIN_CELL_COMBINATION,
+        "inference.within_cell_combination",
+        label="the intersection-union maximum endpoint p-value rule",
+    )
+    _locked_scalar(
         inference["multiplicity"],
-        "holm",
+        _LOCKED_MULTIPLICITY,
         "inference.multiplicity",
         label="Holm adjustment",
     )
-    _locked_scalar(inference["family_size"], 11, "inference.family_size")
+    _locked_scalar(
+        inference["family_size"],
+        _LOCKED_FAMILY_SIZE,
+        "inference.family_size",
+        label="exactly 11 confirmatory cells",
+    )
+
+    decision = _mapping(inference["decision"], "inference.decision")
+    _require_exact_keys(
+        decision,
+        {
+            "requires_all_point_thresholds",
+            "requires_holm_adjusted_cell_p_at_most_alpha",
+            "reports_point_and_inferential_booleans_separately",
+        },
+        "inference.decision",
+    )
+    _locked_scalar(
+        decision["requires_all_point_thresholds"],
+        True,
+        "inference.decision.requires_all_point_thresholds",
+        label="true so all point thresholds are required",
+    )
+    _locked_scalar(
+        decision["requires_holm_adjusted_cell_p_at_most_alpha"],
+        True,
+        "inference.decision.requires_holm_adjusted_cell_p_at_most_alpha",
+        label="true so the Holm-adjusted cell p-value must be at most alpha",
+    )
+    _locked_scalar(
+        decision["reports_point_and_inferential_booleans_separately"],
+        True,
+        "inference.decision.reports_point_and_inferential_booleans_separately",
+        label="true so point and inferential booleans are reported separately",
+    )
+
+    nonestimable = _mapping(inference["nonestimable"], "inference.nonestimable")
+    _require_exact_keys(
+        nonestimable,
+        {"preserves_family_membership", "internal_cell_p_value", "label"},
+        "inference.nonestimable",
+    )
+    _locked_scalar(
+        nonestimable["preserves_family_membership"],
+        True,
+        "inference.nonestimable.preserves_family_membership",
+        label="true to preserve family membership",
+    )
+    _locked_scalar(
+        nonestimable["internal_cell_p_value"],
+        1.0,
+        "inference.nonestimable.internal_cell_p_value",
+        label="the conservative internal p-value 1.0",
+    )
+    _locked_scalar(
+        nonestimable["label"],
+        _LOCKED_NONESTIMABLE_LABEL,
+        "inference.nonestimable.label",
+    )
+
+    pilot_inference = _mapping(inference["pilot"], "inference.pilot")
+    _require_exact_keys(
+        pilot_inference,
+        {"mode", "compute_confirmatory_p_value", "compute_confirmatory_decision"},
+        "inference.pilot",
+    )
+    _locked_scalar(
+        pilot_inference["mode"],
+        _LOCKED_PILOT_MODE,
+        "inference.pilot.mode",
+        label="descriptive_only",
+    )
+    _locked_scalar(
+        pilot_inference["compute_confirmatory_p_value"],
+        False,
+        "inference.pilot.compute_confirmatory_p_value",
+        label="false: no pilot confirmatory p-value",
+    )
+    _locked_scalar(
+        pilot_inference["compute_confirmatory_decision"],
+        False,
+        "inference.pilot.compute_confirmatory_decision",
+        label="false: no pilot confirmatory decision",
+    )
+
+    lower_bound = _mapping(inference["lower_bound"], "inference.lower_bound")
+    _require_exact_keys(
+        lower_bound,
+        {"confidence_level", "scope", "multiplicity_adjusted", "simultaneous"},
+        "inference.lower_bound",
+    )
+    _locked_scalar(
+        lower_bound["confidence_level"],
+        _LOCKED_LOWER_BOUND_CONFIDENCE_LEVEL,
+        "inference.lower_bound.confidence_level",
+        label="0.95 for a one-sided 95% lower bound",
+    )
+    _locked_scalar(
+        lower_bound["scope"],
+        _LOCKED_LOWER_BOUND_SCOPE,
+        "inference.lower_bound.scope",
+        label="marginal",
+    )
+    _locked_scalar(
+        lower_bound["multiplicity_adjusted"],
+        False,
+        "inference.lower_bound.multiplicity_adjusted",
+        label="false: bounds are not multiplicity-adjusted",
+    )
+    _locked_scalar(
+        lower_bound["simultaneous"],
+        False,
+        "inference.lower_bound.simultaneous",
+        label="false: bounds are not simultaneous",
+    )
 
     storage = _mapping(raw["storage"], "storage")
     _require_exact_keys(storage, {"disk_reserve_gib"}, "storage")
@@ -434,9 +822,7 @@ def _validated_payload(raw: dict[Any, Any]) -> dict[str, Any]:
     _require_exact_keys(outputs, {"root", "immutable_run_directory"}, "outputs")
     output_text, _ = _portable_relative_path(outputs["root"], "outputs.root")
     if output_text != _LOCKED_OUTPUT_ROOT:
-        raise ExtensionConfigError(
-            f"outputs.root must be {_LOCKED_OUTPUT_ROOT}"
-        )
+        raise ExtensionConfigError(f"outputs.root must be {_LOCKED_OUTPUT_ROOT}")
     _locked_scalar(
         outputs["immutable_run_directory"],
         True,
@@ -451,6 +837,42 @@ def _validated_payload(raw: dict[Any, Any]) -> dict[str, Any]:
         "recovery_thresholds": dict(thresholds_raw),
         "bootstrap_draws": bootstrap["draws"],
         "bootstrap_seed": bootstrap["seed"],
+        "prospective_amendment_date": amendment["date"],
+        "prospective_amendment_timing": amendment["timing"],
+        "prospective_amendment_note": amendment["note"],
+        "alpha": inference["alpha"],
+        "bootstrap_bit_generator": bootstrap["bit_generator"],
+        "bootstrap_quantile_method": bootstrap["quantile_method"],
+        "alternative": inference["alternative"],
+        "endpoint_tail_p_value": inference["endpoint_tail_p_value"],
+        "within_cell_combination": inference["within_cell_combination"],
+        "multiplicity": inference["multiplicity"],
+        "family_size": inference["family_size"],
+        "decision_requires_all_point_thresholds": decision[
+            "requires_all_point_thresholds"
+        ],
+        "decision_requires_holm_adjusted_cell_p_at_most_alpha": decision[
+            "requires_holm_adjusted_cell_p_at_most_alpha"
+        ],
+        "decision_reports_separate_booleans": decision[
+            "reports_point_and_inferential_booleans_separately"
+        ],
+        "nonestimable_preserves_family_membership": nonestimable[
+            "preserves_family_membership"
+        ],
+        "nonestimable_internal_cell_p_value": nonestimable["internal_cell_p_value"],
+        "nonestimable_label": nonestimable["label"],
+        "pilot_mode": pilot_inference["mode"],
+        "pilot_compute_confirmatory_p_value": pilot_inference[
+            "compute_confirmatory_p_value"
+        ],
+        "pilot_compute_confirmatory_decision": pilot_inference[
+            "compute_confirmatory_decision"
+        ],
+        "lower_bound_confidence_level": lower_bound["confidence_level"],
+        "lower_bound_scope": lower_bound["scope"],
+        "lower_bound_multiplicity_adjusted": lower_bound["multiplicity_adjusted"],
+        "lower_bound_simultaneous": lower_bound["simultaneous"],
         "disk_reserve_gib": reserve,
     }
 

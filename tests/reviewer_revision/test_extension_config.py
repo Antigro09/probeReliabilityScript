@@ -70,6 +70,37 @@ def test_extension_config_locks_eleven_untouched_cells() -> None:
     }
     assert config.bootstrap_draws == 10_000
     assert config.bootstrap_seed == 20260830
+    assert config.prospective_amendment_date == "2026-08-31"
+    assert (
+        config.prospective_amendment_timing
+        == "before_any_confirmatory_endpoint_computation"
+    )
+    assert config.prospective_amendment_note.startswith(
+        "Locks the exact random-number generator"
+    )
+    assert config.alpha == 0.05
+    assert config.bootstrap_bit_generator == "PCG64"
+    assert config.bootstrap_quantile_method == "linear"
+    assert config.alternative == "one_sided"
+    assert config.endpoint_tail_p_value == (
+        "(1 + count(theta_star <= threshold)) / (B + 1)"
+    )
+    assert config.within_cell_combination == "intersection_union_max_endpoint_p"
+    assert config.multiplicity == "holm"
+    assert config.family_size == 11
+    assert config.decision_requires_all_point_thresholds is True
+    assert config.decision_requires_holm_adjusted_cell_p_at_most_alpha is True
+    assert config.decision_reports_separate_booleans is True
+    assert config.nonestimable_preserves_family_membership is True
+    assert config.nonestimable_internal_cell_p_value == 1.0
+    assert config.nonestimable_label == "nonestimable"
+    assert config.pilot_mode == "descriptive_only"
+    assert config.pilot_compute_confirmatory_p_value is False
+    assert config.pilot_compute_confirmatory_decision is False
+    assert config.lower_bound_confidence_level == 0.95
+    assert config.lower_bound_scope == "marginal"
+    assert config.lower_bound_multiplicity_adjusted is False
+    assert config.lower_bound_simultaneous is False
     assert config.disk_reserve_gib == 8.0
     assert config.base_run == Path(
         "results/reviewer_revision_2026_08/20260830T024520Z-7aab3eb"
@@ -102,9 +133,7 @@ def test_extension_config_record_is_portable_json_and_detached() -> None:
     record = config.to_record()
     expected = {
         "config_hash": config.config_hash,
-        "base_run": (
-            "results/reviewer_revision_2026_08/20260830T024520Z-7aab3eb"
-        ),
+        "base_run": ("results/reviewer_revision_2026_08/20260830T024520Z-7aab3eb"),
         "pilot": {
             "model_key": PILOT.model_key,
             "model_id": PILOT.model_id,
@@ -127,6 +156,45 @@ def test_extension_config_record_is_portable_json_and_detached() -> None:
         },
         "bootstrap_draws": 10_000,
         "bootstrap_seed": 20260830,
+        "prospective_amendment": {
+            "date": "2026-08-31",
+            "timing": "before_any_confirmatory_endpoint_computation",
+            "note": (
+                "Locks the exact random-number generator, quantile and tail "
+                "conventions, cell-level intersection-union test, Holm decision "
+                "rule, nonestimable-cell handling, pilot treatment, and honest "
+                "marginal-bound labels."
+            ),
+        },
+        "alpha": 0.05,
+        "bootstrap_bit_generator": "PCG64",
+        "bootstrap_quantile_method": "linear",
+        "alternative": "one_sided",
+        "endpoint_tail_p_value": ("(1 + count(theta_star <= threshold)) / (B + 1)"),
+        "within_cell_combination": "intersection_union_max_endpoint_p",
+        "multiplicity": "holm",
+        "family_size": 11,
+        "decision": {
+            "requires_all_point_thresholds": True,
+            "requires_holm_adjusted_cell_p_at_most_alpha": True,
+            "reports_point_and_inferential_booleans_separately": True,
+        },
+        "nonestimable": {
+            "preserves_family_membership": True,
+            "internal_cell_p_value": 1.0,
+            "label": "nonestimable",
+        },
+        "pilot_inference": {
+            "mode": "descriptive_only",
+            "compute_confirmatory_p_value": False,
+            "compute_confirmatory_decision": False,
+        },
+        "lower_bound": {
+            "confidence_level": 0.95,
+            "scope": "marginal",
+            "multiplicity_adjusted": False,
+            "simultaneous": False,
+        },
         "disk_reserve_gib": 8.0,
     }
 
@@ -219,8 +287,22 @@ def test_extension_config_rejects_recovery_threshold_drift(
     (
         (("inference", "bootstrap", "draws"), 9_999, "10,000"),
         (("inference", "bootstrap", "seed"), 17, "bootstrap.seed"),
+        (("inference", "alpha"), 0.10, "alpha"),
+        (("inference", "bootstrap", "bit_generator"), "MT19937", "PCG64"),
+        (("inference", "bootstrap", "quantile_method"), "lower", "linear"),
         (("inference", "alternative"), "two_sided", "one_sided"),
+        (
+            ("inference", "endpoint_tail_p_value"),
+            "count(theta_star <= threshold) / B",
+            "tail p-value",
+        ),
+        (
+            ("inference", "within_cell_combination"),
+            "min_endpoint_p",
+            "intersection-union",
+        ),
         (("inference", "multiplicity"), "bonferroni", "Holm"),
+        (("inference", "family_size"), 10, "exactly 11"),
         (
             ("inference", "bootstrap", "shared_resamples_across_models_within_task"),
             False,
@@ -229,6 +311,121 @@ def test_extension_config_rejects_recovery_threshold_drift(
     ),
 )
 def test_extension_config_rejects_bootstrap_or_inference_drift(
+    tmp_path: Path,
+    path: tuple[str | int, ...],
+    replacement: Any,
+    message: str,
+) -> None:
+    payload = _valid_extension_payload()
+    _set_path(payload, path, replacement)
+
+    with pytest.raises(ExtensionConfigError, match=message):
+        load_extension_config(_write_yaml(tmp_path, payload))
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement", "message"),
+    (
+        (
+            ("inference", "decision", "requires_all_point_thresholds"),
+            False,
+            "point thresholds",
+        ),
+        (
+            (
+                "inference",
+                "decision",
+                "requires_holm_adjusted_cell_p_at_most_alpha",
+            ),
+            False,
+            "Holm-adjusted",
+        ),
+        (
+            (
+                "inference",
+                "decision",
+                "reports_point_and_inferential_booleans_separately",
+            ),
+            False,
+            "separately",
+        ),
+        (
+            ("inference", "nonestimable", "preserves_family_membership"),
+            False,
+            "family membership",
+        ),
+        (
+            ("inference", "nonestimable", "internal_cell_p_value"),
+            0.99,
+            "p-value 1.0",
+        ),
+        (
+            ("inference", "nonestimable", "label"),
+            "failed",
+            "nonestimable",
+        ),
+        (
+            ("inference", "pilot", "mode"),
+            "confirmatory",
+            "descriptive",
+        ),
+        (
+            ("inference", "pilot", "compute_confirmatory_p_value"),
+            True,
+            "pilot confirmatory p-value",
+        ),
+        (
+            ("inference", "pilot", "compute_confirmatory_decision"),
+            True,
+            "pilot confirmatory decision",
+        ),
+        (
+            ("inference", "lower_bound", "confidence_level"),
+            0.90,
+            "95%",
+        ),
+        (
+            ("inference", "lower_bound", "scope"),
+            "simultaneous",
+            "marginal",
+        ),
+        (
+            ("inference", "lower_bound", "multiplicity_adjusted"),
+            True,
+            "not multiplicity-adjusted",
+        ),
+        (
+            ("inference", "lower_bound", "simultaneous"),
+            True,
+            "not simultaneous",
+        ),
+    ),
+)
+def test_extension_config_rejects_decision_or_bound_drift(
+    tmp_path: Path,
+    path: tuple[str | int, ...],
+    replacement: Any,
+    message: str,
+) -> None:
+    payload = _valid_extension_payload()
+    _set_path(payload, path, replacement)
+
+    with pytest.raises(ExtensionConfigError, match=message):
+        load_extension_config(_write_yaml(tmp_path, payload))
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement", "message"),
+    (
+        (("prospective_amendment", "date"), "2026-08-30", "2026-08-31"),
+        (
+            ("prospective_amendment", "timing"),
+            "after_endpoint_computation",
+            "before.*confirmatory endpoint",
+        ),
+    ),
+)
+def test_extension_config_rejects_prospective_amendment_drift(
     tmp_path: Path,
     path: tuple[str | int, ...],
     replacement: Any,

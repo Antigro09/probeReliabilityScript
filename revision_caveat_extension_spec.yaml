@@ -5,6 +5,17 @@ purpose: >-
   middle-layer model-task cells while retaining the inspected Qwen/SST-2
   layer-14 result as a disclosed pilot only.
 
+# Prospective clarification committed before any confirmatory endpoint was
+# computed or inspected. It closes inference-rule ambiguities without changing
+# the locked cells, endpoints, thresholds, draw count, seed, or pilot status.
+prospective_amendment:
+  date: "2026-08-31"
+  timing: before_any_confirmatory_endpoint_computation
+  note: >-
+    Locks the exact random-number generator, quantile and tail conventions,
+    cell-level intersection-union test, Holm decision rule, nonestimable-cell
+    handling, pilot treatment, and honest marginal-bound labels.
+
 base_run: results/reviewer_revision_2026_08/20260830T024520Z-7aab3eb
 
 construct_panel:
@@ -66,14 +77,36 @@ construct_panel:
     control_retention_ratio: 0.80
 
 inference:
+  alpha: 0.05
   bootstrap:
     draws: 10000
     seed: 20260830
+    bit_generator: PCG64
+    quantile_method: linear
     resampling_unit: final_test_group_id
     shared_resamples_across_models_within_task: true
   alternative: one_sided
+  endpoint_tail_p_value: "(1 + count(theta_star <= threshold)) / (B + 1)"
+  within_cell_combination: intersection_union_max_endpoint_p
   multiplicity: holm
   family_size: 11
+  decision:
+    requires_all_point_thresholds: true
+    requires_holm_adjusted_cell_p_at_most_alpha: true
+    reports_point_and_inferential_booleans_separately: true
+  nonestimable:
+    preserves_family_membership: true
+    internal_cell_p_value: 1.0
+    label: nonestimable
+  pilot:
+    mode: descriptive_only
+    compute_confirmatory_p_value: false
+    compute_confirmatory_decision: false
+  lower_bound:
+    confidence_level: 0.95
+    scope: marginal
+    multiplicity_adjusted: false
+    simultaneous: false
 
 storage:
   disk_reserve_gib: 8.0
