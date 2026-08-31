@@ -3107,6 +3107,8 @@ class _ConstructLayout:
     array_root: Path
     rows_csv: Path
     rows_parquet: Path
+    group_rows_csv: Path | None
+    group_rows_parquet: Path | None
     summary_path: Path
     shard_experiment: str
     cell: ConstructCell | None
@@ -3164,6 +3166,8 @@ def _construct_layout(
             array_root=run_dir / "arrays" / "construct",
             rows_csv=run_dir / "construct_check_rows.csv",
             rows_parquet=run_dir / "construct_check_rows.parquet",
+            group_rows_csv=None,
+            group_rows_parquet=None,
             summary_path=run_dir / "construct_check_summary.json",
             shard_experiment="construct_edits",
             cell=cell,
@@ -3180,6 +3184,8 @@ def _construct_layout(
         array_root=run_dir / "arrays" / "construct" / "cells" / cell.slug,
         rows_csv=artifact_root / "construct_check_rows.csv",
         rows_parquet=artifact_root / "construct_check_rows.parquet",
+        group_rows_csv=artifact_root / "construct_group_rows.csv",
+        group_rows_parquet=artifact_root / "construct_group_rows.parquet",
         summary_path=artifact_root / "construct_check_summary.json",
         shard_experiment=f"construct_edits.{cell.slug}",
         cell=cell,
@@ -3734,6 +3740,477 @@ def _regenerate_construct_provenance(
             hyperparameter_ref: hyperparameter_sha256,
         },
     }
+
+
+_CONSTRUCT_GROUP_KEY_COLUMNS = (
+    "model_key",
+    "model_id",
+    "task",
+    "layer",
+    "row_kind",
+    "edit_id",
+    "evaluation_family",
+    "decoder_seed",
+    "label",
+    "group_id",
+)
+
+
+def _single_construct_artifact_value(value: Any, *, field: str) -> str:
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if not isinstance(value, (list, tuple)) or len(value) != 1:
+        raise RuntimeError(f"construct {field} must contain exactly the seed-0 artifact")
+    item = value[0]
+    if not isinstance(item, str) or not item:
+        raise RuntimeError(f"construct {field} contains an invalid artifact value")
+    return item
+
+
+def _load_construct_decoder_per_example(
+    context: RunContext,
+    *,
+    reference: str,
+    checkpoint_sha256: str,
+    final_example_ids: list[str],
+    cell: ConstructCell,
+    legacy_layout: bool,
+    edit_id: str,
+    label: str,
+) -> tuple[torch.Tensor, torch.Tensor, str]:
+    if re.fullmatch(r"[0-9a-f]{64}", checkpoint_sha256) is None:
+        raise RuntimeError("construct decoder checkpoint hash is not SHA-256")
+    path = _run_relative_path(context, reference)
+    if not path.is_file() or path.stat().st_size == 0:
+        raise RuntimeError(f"construct decoder per-example artifact is missing: {reference}")
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, Mapping) or payload.get("schema_version") != 1:
+        raise RuntimeError("construct decoder per-example artifact has an invalid schema")
+    if payload.get("checkpoint_sha256") != checkpoint_sha256:
+        raise RuntimeError("construct decoder per-example checkpoint hash mismatch")
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise TypeError("construct decoder per-example metadata is missing")
+    expected_metadata = {
+        "edit_id": edit_id,
+        "family": "fresh_linear",
+        "label": label,
+    }
+    if any(metadata.get(key) != value for key, value in expected_metadata.items()):
+        raise RuntimeError("construct decoder per-example metadata mismatch")
+    if legacy_layout:
+        if "cell" in metadata:
+            raise RuntimeError("legacy construct decoder metadata unexpectedly contains a cell")
+    elif metadata.get("cell") != _construct_cell_record(cell):
+        raise RuntimeError("construct decoder per-example cell metadata mismatch")
+    example_ids = payload.get("example_ids")
+    if not isinstance(example_ids, list) or example_ids != final_example_ids:
+        raise RuntimeError("construct decoder per-example IDs are not final-test aligned")
+    split_names = payload.get("split_names")
+    if split_names != ["final_test"] * len(final_example_ids):
+        raise RuntimeError("construct decoder per-example split names are invalid")
+    predictions = payload.get("predictions")
+    labels = payload.get("labels")
+    if not isinstance(predictions, torch.Tensor) or not isinstance(labels, torch.Tensor):
+        raise TypeError("construct decoder per-example predictions/labels are missing")
+    predictions = predictions.detach().cpu()
+    labels = labels.detach().cpu()
+    if (
+        predictions.ndim != 1
+        or labels.ndim != 1
+        or predictions.shape != labels.shape
+        or len(predictions) != len(final_example_ids)
+    ):
+        raise RuntimeError("construct decoder per-example prediction shape mismatch")
+    if (
+        predictions.dtype == torch.bool
+        or labels.dtype == torch.bool
+        or torch.is_floating_point(predictions)
+        or torch.is_floating_point(labels)
+        or not torch.isin(predictions, torch.tensor([0, 1])).all()
+        or not torch.isin(labels, torch.tensor([0, 1])).all()
+    ):
+        raise RuntimeError("construct decoder per-example predictions/labels are not binary integers")
+    return predictions.long().eq(labels.long()), labels.long(), sha256_file(path)
+
+
+def _construct_group_records(
+    *,
+    common: Mapping[str, Any],
+    correct: torch.Tensor,
+    final_group_ids: list[str],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for group_id in sorted(set(final_group_ids)):
+        indices = [
+            index for index, observed_group in enumerate(final_group_ids)
+            if observed_group == group_id
+        ]
+        records.append(
+            {
+                **dict(common),
+                "group_id": group_id,
+                "n_examples": len(indices),
+                "correct_count": int(correct[indices].sum().item()),
+            }
+        )
+    return records
+
+
+def _validate_construct_per_example_accuracy(
+    correct: torch.Tensor,
+    expected: Any,
+    *,
+    identity: str,
+) -> None:
+    try:
+        expected_accuracy = float(expected)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"construct summarized accuracy is invalid for {identity}"
+        ) from exc
+    observed_accuracy = float(correct.double().mean().item())
+    if not math.isfinite(expected_accuracy) or not math.isclose(
+        observed_accuracy,
+        expected_accuracy,
+        rel_tol=0.0,
+        abs_tol=1.0e-12,
+    ):
+        raise RuntimeError(
+            "construct per-example accuracy mismatch for "
+            f"{identity}: rows={observed_accuracy}, summary={expected_accuracy}"
+        )
+
+
+def build_construct_group_rows(
+    context: RunContext,
+    config: RevisionConfig,
+    *,
+    cell: ConstructCell,
+    legacy_layout: bool = False,
+) -> pd.DataFrame:
+    """Reconstruct fresh-linear seed-0 group sufficient statistics from artifacts."""
+
+    _validate_construct_cell(config, cell)
+    if legacy_layout and cell != _PILOT_CONSTRUCT_CELL:
+        raise ValueError("the legacy construct layout is restricted to the pilot cell")
+    layout = _construct_layout(context.run_dir, cell, legacy=legacy_layout)
+    if not layout.rows_parquet.is_file():
+        raise RuntimeError("construct rows must be materialized before group statistics")
+    source = pd.read_parquet(layout.rows_parquet).reset_index(drop=True)
+    if source.empty or (source["status"] != "ok").any():
+        raise RuntimeError("construct group statistics require an all-ok construct cell")
+    observed_cells = set(
+        source[["model_key", "model_id", "task", "layer"]].itertuples(
+            index=False, name=None
+        )
+    )
+    expected_cell = {(cell.model_key, cell.model_id, cell.task, int(cell.layer))}
+    if observed_cells != expected_cell:
+        raise RuntimeError("construct source rows do not match the requested cell")
+
+    split_ref, split_sha256, split_payload = _load_hashed_construct_json(
+        context,
+        source,
+        label="split manifest",
+        reference_column="split_manifest_ref",
+        hash_column="split_manifest_sha256",
+    )
+    _, _, baseline_payload = _load_hashed_construct_json(
+        context,
+        source,
+        label="fresh decoder baseline",
+        reference_column="fresh_decoder_baseline_ref",
+        hash_column="fresh_decoder_baseline_sha256",
+    )
+    if not legacy_layout:
+        expected_record = _construct_cell_record(cell)
+        if split_payload.get("cell") != expected_record:
+            raise RuntimeError("construct split manifest cell identity mismatch")
+        if baseline_payload.get("cell") != expected_record:
+            raise RuntimeError("construct baseline artifact cell identity mismatch")
+    subdivision = split_payload.get("intervention_subdivision")
+    if not isinstance(subdivision, list):
+        raise TypeError("construct split manifest lacks an intervention subdivision")
+    final_rows = sorted(
+        (
+            row for row in subdivision
+            if isinstance(row, Mapping) and row.get("subset") == "final_test"
+        ),
+        key=lambda row: row.get("position_in_subset", -1),
+    )
+    if not final_rows:
+        raise RuntimeError("construct split manifest has no final-test rows")
+    positions = [row.get("position_in_subset") for row in final_rows]
+    if positions != list(range(len(final_rows))):
+        raise RuntimeError("construct final-test manifest positions are not contiguous")
+    final_example_ids = [row.get("example_id") for row in final_rows]
+    final_group_ids = [row.get("group_id") for row in final_rows]
+    if (
+        any(not isinstance(value, str) or not value for value in final_example_ids)
+        or len(set(final_example_ids)) != len(final_example_ids)
+        or any(not isinstance(value, str) or not value for value in final_group_ids)
+    ):
+        raise RuntimeError("construct final-test manifest identities are invalid")
+
+    provenance = {
+        "run_id": _unique_construct_row_value(source, "run_id"),
+        "git_commit": _unique_construct_row_value(source, "git_commit"),
+        "config_hash": _unique_construct_row_value(source, "config_hash"),
+        **_construct_cell_record(cell),
+        "evaluation_family": "fresh_linear",
+        "decoder_seed": 0,
+        "split_manifest_ref": split_ref,
+        "split_manifest_sha256": split_sha256,
+        "status": "ok",
+        "failure_stage": None,
+        "failure_reason": None,
+    }
+    records: list[dict[str, Any]] = []
+    baseline_labels: dict[str, torch.Tensor] = {}
+    try:
+        fresh_linear_baseline = baseline_payload["fresh_linear"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError("construct baseline artifact lacks fresh_linear records") from exc
+    for label in ("target", "control"):
+        try:
+            baseline = fresh_linear_baseline[label]
+            reference = _single_construct_artifact_value(
+                baseline["per_example_refs"], field=f"baseline {label} per-example refs"
+            )
+            checkpoint_sha256 = _single_construct_artifact_value(
+                baseline["checkpoint_hashes"], field=f"baseline {label} checkpoint hashes"
+            )
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError(
+                f"construct baseline artifact lacks fresh_linear/{label} provenance"
+            ) from exc
+        correct, observed_labels, per_example_sha256 = (
+            _load_construct_decoder_per_example(
+                context,
+                reference=reference,
+                checkpoint_sha256=checkpoint_sha256,
+                final_example_ids=final_example_ids,
+                cell=cell,
+                legacy_layout=legacy_layout,
+                edit_id="unedited",
+                label=label,
+            )
+        )
+        try:
+            baseline_accuracy = baseline["metrics"]["accuracy"]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError(
+                f"construct baseline artifact lacks fresh_linear/{label} accuracy"
+            ) from exc
+        _validate_construct_per_example_accuracy(
+            correct,
+            baseline_accuracy,
+            identity=f"baseline/{label}",
+        )
+        baseline_labels[label] = observed_labels
+        records.extend(
+            _construct_group_records(
+                common={
+                    **provenance,
+                    "row_kind": "baseline",
+                    "label": label,
+                    "decoder_checkpoint_sha256": checkpoint_sha256,
+                    "decoder_per_example_ref": reference,
+                    "decoder_per_example_sha256": per_example_sha256,
+                    "edit_id": None,
+                    "edit_object": None,
+                    "architecture": None,
+                    "candidate_seed": None,
+                    "edit_hash": None,
+                },
+                correct=correct,
+                final_group_ids=final_group_ids,
+            )
+        )
+
+    candidate_keys = [
+        key for key in config.construct_edit_keys()
+        if key.edit_kind == "dcand_crossfit"
+    ]
+    expected_edits = {
+        _construct_edit_id(key.edit_kind, key.architecture, int(key.seed)): key
+        for key in candidate_keys
+    }
+    candidate_rows = source.loc[
+        (source["evaluation_family"] == "fresh_linear")
+        & (source["edit_object"] == "dcand_crossfit")
+    ].copy()
+    if set(candidate_rows["edit_id"]) != set(expected_edits):
+        raise RuntimeError("construct group statistics require the exact candidate-edit set")
+    for edit_id in sorted(expected_edits):
+        edit_key = expected_edits[edit_id]
+        selected = candidate_rows.loc[candidate_rows["edit_id"] == edit_id]
+        if len(selected) != 2 or set(selected["label"]) != {"target", "control"}:
+            raise RuntimeError(f"construct candidate rows are incomplete for {edit_id}")
+        edit_hashes = set(selected["edit_hash"])
+        if len(edit_hashes) != 1:
+            raise RuntimeError(f"construct candidate edit hash is inconsistent for {edit_id}")
+        edit_hash = str(next(iter(edit_hashes)))
+        if re.fullmatch(r"[0-9a-f]{64}", edit_hash) is None:
+            raise RuntimeError(f"construct candidate edit hash is invalid for {edit_id}")
+        for label in ("target", "control"):
+            row = selected.loc[selected["label"] == label].iloc[0]
+            if (
+                row["architecture"] != edit_key.architecture
+                or int(row["candidate_seed"]) != int(edit_key.seed)
+            ):
+                raise RuntimeError(f"construct candidate identity mismatch for {edit_id}")
+            reference = _single_construct_artifact_value(
+                row["per_example_refs"], field=f"{edit_id}/{label} per-example refs"
+            )
+            checkpoint_sha256 = _single_construct_artifact_value(
+                row["decoder_checkpoint_hashes"],
+                field=f"{edit_id}/{label} checkpoint hashes",
+            )
+            correct, observed_labels, per_example_sha256 = (
+                _load_construct_decoder_per_example(
+                    context,
+                    reference=reference,
+                    checkpoint_sha256=checkpoint_sha256,
+                    final_example_ids=final_example_ids,
+                    cell=cell,
+                    legacy_layout=legacy_layout,
+                    edit_id=edit_id,
+                    label=label,
+                )
+            )
+            _validate_construct_per_example_accuracy(
+                correct,
+                row["accuracy"],
+                identity=f"{edit_id}/{label}",
+            )
+            if not torch.equal(observed_labels, baseline_labels[label]):
+                raise RuntimeError(
+                    f"construct decoder labels changed after edit for {edit_id}/{label}"
+                )
+            records.extend(
+                _construct_group_records(
+                    common={
+                        **provenance,
+                        "row_kind": "post_edit",
+                        "label": label,
+                        "decoder_checkpoint_sha256": checkpoint_sha256,
+                        "decoder_per_example_ref": reference,
+                        "decoder_per_example_sha256": per_example_sha256,
+                        "edit_id": edit_id,
+                        "edit_object": "dcand_crossfit",
+                        "architecture": edit_key.architecture,
+                        "candidate_seed": int(edit_key.seed),
+                        "edit_hash": edit_hash,
+                    },
+                    correct=correct,
+                    final_group_ids=final_group_ids,
+                )
+            )
+
+    frame = pd.DataFrame(records)
+    duplicates = frame.duplicated(list(_CONSTRUCT_GROUP_KEY_COLUMNS), keep=False)
+    if duplicates.any():
+        raise RuntimeError("construct group sufficient-statistic keys are not unique")
+    return frame.sort_values(
+        list(_CONSTRUCT_GROUP_KEY_COLUMNS), kind="mergesort"
+    ).reset_index(drop=True)
+
+
+def _materialize_construct_group_rows(
+    rows: pd.DataFrame | Iterable[Mapping[str, Any]],
+    *,
+    csv_path: Path,
+    parquet_path: Path,
+) -> pd.DataFrame:
+    frame = pd.DataFrame(rows).sort_values(
+        list(_CONSTRUCT_GROUP_KEY_COLUMNS), kind="mergesort"
+    ).reset_index(drop=True)
+    existing_frames: list[pd.DataFrame] = []
+    for path, loader in (
+        (csv_path, pd.read_csv),
+        (parquet_path, pd.read_parquet),
+    ):
+        if path.is_file():
+            existing_frames.append(loader(path).reset_index(drop=True))
+    if existing_frames:
+        existing_statuses = set(existing_frames[0].get("status", pd.Series(dtype=str)))
+        new_statuses = set(frame.get("status", pd.Series(dtype=str)))
+        if existing_statuses == {"ok"} and new_statuses != {"ok"}:
+            return existing_frames[0]
+        if existing_statuses == {"ok"} and new_statuses == {"ok"}:
+            try:
+                for existing in existing_frames:
+                    pd.testing.assert_frame_equal(
+                        existing.astype(object).where(existing.notna(), None),
+                        frame.astype(object).where(frame.notna(), None),
+                        check_dtype=False,
+                        check_like=False,
+                    )
+            except AssertionError as exc:
+                raise RuntimeError(
+                    "immutable construct group rows differ on resume"
+                ) from exc
+            if len(existing_frames) == 2:
+                return pd.read_parquet(parquet_path).reset_index(drop=True)
+    return materialize_rows(
+        frame,
+        csv_path=csv_path,
+        parquet_path=parquet_path,
+        key_columns=_CONSTRUCT_GROUP_KEY_COLUMNS,
+    )
+
+
+def materialize_construct_cell_status(
+    context: RunContext,
+    config: RevisionConfig,
+    *,
+    cell: ConstructCell,
+    status: str,
+    failure_stage: str,
+    failure_reason: str,
+) -> pd.DataFrame:
+    """Persist one analysis-compatible explicit non-ok construct cell record."""
+
+    if status not in {"failed", "nonestimable"}:
+        raise ValueError("construct cell status must be failed or nonestimable")
+    if not failure_stage.strip() or not failure_reason.strip():
+        raise ValueError("construct cell failure stage and reason must be nonblank")
+    layout = _construct_layout(context.run_dir, cell)
+    if layout.group_rows_csv is None or layout.group_rows_parquet is None:
+        raise RuntimeError("generic construct group-row paths are unavailable")
+    row = {
+        "run_id": context.run_id,
+        "git_commit": _current_commit(),
+        "config_hash": config.config_hash,
+        **_construct_cell_record(cell),
+        "row_kind": "cell_status",
+        "evaluation_family": "fresh_linear",
+        "decoder_seed": 0,
+        "label": None,
+        "group_id": None,
+        "n_examples": 0,
+        "correct_count": 0,
+        "split_manifest_ref": None,
+        "split_manifest_sha256": None,
+        "decoder_checkpoint_sha256": None,
+        "decoder_per_example_ref": None,
+        "decoder_per_example_sha256": None,
+        "edit_id": None,
+        "edit_object": None,
+        "architecture": None,
+        "candidate_seed": None,
+        "edit_hash": None,
+        "status": status,
+        "failure_stage": failure_stage,
+        "failure_reason": failure_reason,
+    }
+    return _materialize_construct_group_rows(
+        [row],
+        csv_path=layout.group_rows_csv,
+        parquet_path=layout.group_rows_parquet,
+    )
 
 
 def _write_immutable_json(path: Path, payload: Any) -> None:
@@ -4591,6 +5068,21 @@ def _run_construct_cell(
         )
         raise RuntimeError(f"construct check contains {len(fatal_errors)} failed edits")
     construct_provenance = _regenerate_construct_provenance(context, frame)
+    group_frame: pd.DataFrame | None = None
+    if not legacy_layout:
+        if layout.group_rows_csv is None or layout.group_rows_parquet is None:
+            raise RuntimeError("generic construct group-row paths are unavailable")
+        group_frame = build_construct_group_rows(
+            context,
+            config,
+            cell=cell,
+            legacy_layout=False,
+        )
+        group_frame = _materialize_construct_group_rows(
+            group_frame,
+            csv_path=layout.group_rows_csv,
+            parquet_path=layout.group_rows_parquet,
+        )
     expected_edit_ids = [_construct_edit_id(*key) for key in edit_keys]
     summary = summarize_construct_check(
         frame,
@@ -4601,6 +5093,14 @@ def _run_construct_cell(
         generating_git_commit=_current_commit(),
     )
     summary["status"] = "ok"
+    if group_frame is not None:
+        summary["construct_group_rows_ref"] = _relative(
+            layout.group_rows_parquet, context.run_dir
+        )
+        summary["construct_group_rows_sha256"] = sha256_file(
+            layout.group_rows_parquet
+        )
+        summary["construct_group_row_count"] = len(group_frame)
     summary.update(
         {
             "cell": layout.summary_cell,
@@ -4619,6 +5119,16 @@ def _run_construct_cell(
                 "status": "ok",
                 "edits": len(edit_keys),
                 "rows": len(frame),
+                **(
+                    {
+                        "construct_group_rows": len(group_frame),
+                        "construct_group_rows_sha256": sha256_file(
+                            layout.group_rows_parquet
+                        ),
+                    }
+                    if group_frame is not None
+                    else {}
+                ),
             }
         }
     )
@@ -4634,13 +5144,24 @@ def run_construct_cell(
 ) -> dict[str, Any]:
     """Run one namespaced middle-layer construct cell."""
 
-    return _run_construct_cell(
-        context,
-        config,
-        cell=cell,
-        device=device,
-        legacy_layout=False,
-    )
+    try:
+        return _run_construct_cell(
+            context,
+            config,
+            cell=cell,
+            device=device,
+            legacy_layout=False,
+        )
+    except Exception as error:
+        materialize_construct_cell_status(
+            context,
+            config,
+            cell=cell,
+            status="failed",
+            failure_stage="construct_cell_execution",
+            failure_reason=f"{type(error).__name__}: {error}",
+        )
+        raise
 
 
 def run_construct_check(

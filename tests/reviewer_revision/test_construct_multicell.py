@@ -11,7 +11,12 @@ import pytest
 import torch
 
 from src.reviewer_revision import runner
-from src.reviewer_revision.artifacts import RunContext, sha256_json, sha256_tensor
+from src.reviewer_revision.artifacts import (
+    RunContext,
+    sha256_file,
+    sha256_json,
+    sha256_tensor,
+)
 from src.reviewer_revision.config import ConstructEditKey
 from src.reviewer_revision.extension_config import ConstructCell
 from src.reviewer_revision.runner import (
@@ -58,6 +63,12 @@ def test_construct_cell_layout_namespaces_every_artifact_family(tmp_path):
     )
     assert bert_layout.array_root == (
         tmp_path / "arrays" / "construct" / "cells" / bert.slug
+    )
+    assert bert_layout.group_rows_csv == (
+        tmp_path / "construct" / "cells" / bert.slug / "construct_group_rows.csv"
+    )
+    assert bert_layout.group_rows_parquet == (
+        tmp_path / "construct" / "cells" / bert.slug / "construct_group_rows.parquet"
     )
     assert bert_layout.summary_cell == {
         "model_key": bert.model_key,
@@ -150,6 +161,8 @@ def test_legacy_construct_layout_row_and_wrapper_contract_remain_exact(
     assert legacy.rows_csv == tmp_path / "construct_check_rows.csv"
     assert legacy.rows_parquet == tmp_path / "construct_check_rows.parquet"
     assert legacy.summary_path == tmp_path / "construct_check_summary.json"
+    assert legacy.group_rows_csv is None
+    assert legacy.group_rows_parquet is None
     assert legacy.shard_experiment == "construct_edits"
     assert legacy.shard_key(edit_key) == edit_key
     assert legacy.summary_cell == {
@@ -283,7 +296,11 @@ def _toy_subdivision(task: str):
         {
             "subset": subset,
             "position_in_subset": position,
-            "group_id": f"{task}-{subset}-group-{position}",
+            "group_id": (
+                f"{task}-{subset}-group-0"
+                if subset == "final_test"
+                else f"{task}-{subset}-group-{position}"
+            ),
             "example_id": f"{task}-{subset}-example-{position}",
         }
         for subset in subsets
@@ -382,19 +399,38 @@ def _install_toy_construct_environment(monkeypatch, *, interrupt_once: bool):
         lambda **_kwargs: selection,
     )
 
-    def fake_fresh_checkpoint(path: Path, *, metadata, **_kwargs):
+    def fake_fresh_checkpoint(
+        path: Path,
+        *,
+        metadata,
+        y_final,
+        final_example_ids,
+        **_kwargs,
+    ):
         path = Path(path)
         state.checkpoint_calls.append((path, dict(metadata)))
-        accuracy = 0.8 if "unedited" in path.parts else 0.7
+        accuracy = 1.0 if "unedited" in path.parts else 0.5
         checkpoint_hash = sha256_json({"path": path.as_posix(), "metadata": metadata})
-        runner.atomic_torch_save(
+        runner._write_immutable_torch(
             path,
             {"checkpoint_sha256": checkpoint_hash, "metadata": dict(metadata)},
         )
         per_example_path = path.with_suffix(".per-example.pt")
-        runner.atomic_torch_save(
+        labels = y_final.detach().cpu().long()
+        predictions = labels.clone()
+        if "unedited" not in path.parts:
+            predictions[-1] = 1 - predictions[-1]
+        runner._write_immutable_torch(
             per_example_path,
-            {"checkpoint_sha256": checkpoint_hash, "metadata": dict(metadata)},
+            {
+                "schema_version": 1,
+                "metadata": dict(metadata),
+                "checkpoint_sha256": checkpoint_hash,
+                "example_ids": list(final_example_ids),
+                "split_names": ["final_test"] * len(final_example_ids),
+                "predictions": predictions,
+                "labels": labels,
+            },
         )
         return (
             {
@@ -643,6 +679,197 @@ def test_two_construct_cells_interrupt_resume_without_cross_cell_collisions(
             )["source_data_hash"]
             == f"all-data-{qwen.task}"
         )
+    finally:
+        context.close()
+
+
+def test_generic_construct_cell_materializes_group_sufficient_statistics(
+    monkeypatch, tmp_path
+):
+    config, _state = _install_toy_construct_environment(
+        monkeypatch,
+        interrupt_once=False,
+    )
+    bert, _qwen = _cells()
+    context = _new_context(tmp_path, config)
+    try:
+        run_construct_cell(
+            context,
+            config,
+            cell=bert,
+            device=torch.device("cpu"),
+        )
+        layout = _construct_layout(context.run_dir, bert)
+
+        assert layout.group_rows_csv.is_file()
+        assert layout.group_rows_parquet.is_file()
+        rows = pd.read_parquet(layout.group_rows_parquet)
+        assert set(rows.columns) >= {
+            "model_key",
+            "model_id",
+            "task",
+            "layer",
+            "row_kind",
+            "evaluation_family",
+            "decoder_seed",
+            "label",
+            "group_id",
+            "n_examples",
+            "correct_count",
+            "split_manifest_sha256",
+            "decoder_checkpoint_sha256",
+            "edit_id",
+            "edit_object",
+            "architecture",
+            "candidate_seed",
+            "edit_hash",
+            "status",
+            "failure_stage",
+            "failure_reason",
+        }
+        assert len(rows) == 6
+        assert set(
+            rows[["model_key", "model_id", "task", "layer"]].itertuples(
+                index=False, name=None
+            )
+        ) == {(bert.model_key, bert.model_id, bert.task, bert.layer)}
+        assert set(rows["evaluation_family"]) == {"fresh_linear"}
+        assert set(rows["decoder_seed"]) == {0}
+        assert set(rows["status"]) == {"ok"}
+        assert rows[["failure_stage", "failure_reason"]].isna().all().all()
+        assert set(rows["group_id"]) == {f"{bert.task}-final_test-group-0"}
+        assert set(rows["n_examples"]) == {2}
+        assert set(rows.loc[rows["row_kind"] == "baseline", "correct_count"]) == {2}
+        assert set(rows.loc[rows["row_kind"] == "post_edit", "correct_count"]) == {1}
+        assert len(rows.loc[rows["row_kind"] == "baseline"]) == 2
+        assert len(rows.loc[rows["row_kind"] == "post_edit"]) == 4
+        assert (
+            rows.loc[
+                rows["row_kind"] == "baseline",
+                ["edit_id", "edit_object", "architecture", "candidate_seed", "edit_hash"],
+            ]
+            .isna()
+            .all()
+            .all()
+        )
+        post = rows.loc[rows["row_kind"] == "post_edit"]
+        assert set(post["edit_id"]) == {
+            "dcand_crossfit-linear-seed0",
+            "dcand_crossfit-linear-seed1",
+        }
+        assert set(post["edit_object"]) == {"dcand_crossfit"}
+        assert set(post["architecture"]) == {"linear"}
+        assert set(post["candidate_seed"]) == {0.0, 1.0}
+        assert post["edit_hash"].str.fullmatch(r"[0-9a-f]{64}").all()
+        split_hash = sha256_file(layout.artifact_root / "split_manifest.json")
+        assert set(rows["split_manifest_sha256"]) == {split_hash}
+        assert rows["decoder_checkpoint_sha256"].str.fullmatch(r"[0-9a-f]{64}").all()
+
+        rebuilt = runner.build_construct_group_rows(
+            context,
+            config,
+            cell=bert,
+            legacy_layout=False,
+        )
+        pd.testing.assert_frame_equal(rows, rebuilt, check_dtype=False)
+    finally:
+        context.close()
+
+
+def test_generic_construct_failure_materializes_one_explicit_status_row(
+    monkeypatch, tmp_path
+):
+    config = _ToyConstructConfig()
+    bert, _qwen = _cells()
+    context = _new_context(tmp_path, config)
+    monkeypatch.setattr(
+        runner,
+        "_run_construct_cell",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            run_construct_cell(
+                context,
+                config,
+                cell=bert,
+                device=torch.device("cpu"),
+            )
+        layout = _construct_layout(context.run_dir, bert)
+        rows = pd.read_parquet(layout.group_rows_parquet)
+        assert len(rows) == 1
+        row = rows.iloc[0]
+        assert row[["model_key", "model_id", "task", "layer"]].tolist() == [
+            bert.model_key,
+            bert.model_id,
+            bert.task,
+            bert.layer,
+        ]
+        assert row["row_kind"] == "cell_status"
+        assert row["evaluation_family"] == "fresh_linear"
+        assert row["decoder_seed"] == 0
+        assert row["status"] == "failed"
+        assert row["failure_stage"] == "construct_cell_execution"
+        assert row["failure_reason"] == "RuntimeError: boom"
+        assert row["n_examples"] == 0
+        assert row["correct_count"] == 0
+        assert pd.isna(
+            row[
+                [
+                    "label",
+                    "group_id",
+                    "split_manifest_sha256",
+                    "decoder_checkpoint_sha256",
+                    "edit_id",
+                    "edit_object",
+                    "architecture",
+                    "candidate_seed",
+                    "edit_hash",
+                ]
+            ]
+        ).all()
+    finally:
+        context.close()
+
+
+def test_construct_group_rows_reject_per_example_accuracy_drift(
+    monkeypatch, tmp_path
+):
+    config, _state = _install_toy_construct_environment(
+        monkeypatch,
+        interrupt_once=False,
+    )
+    bert, _qwen = _cells()
+    context = _new_context(tmp_path, config)
+    try:
+        run_construct_cell(
+            context,
+            config,
+            cell=bert,
+            device=torch.device("cpu"),
+        )
+        layout = _construct_layout(context.run_dir, bert)
+        per_example_path = (
+            layout.checkpoint_root
+            / "fresh"
+            / "unedited"
+            / "fresh_linear-target-seed0.per-example.pt"
+        )
+        payload = torch.load(
+            per_example_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+        payload["predictions"] = 1 - payload["labels"]
+        runner.atomic_torch_save(per_example_path, payload)
+
+        with pytest.raises(RuntimeError, match="per-example accuracy mismatch"):
+            runner.build_construct_group_rows(
+                context,
+                config,
+                cell=bert,
+                legacy_layout=False,
+            )
     finally:
         context.close()
 
