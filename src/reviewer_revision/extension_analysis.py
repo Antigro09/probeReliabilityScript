@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -23,8 +25,15 @@ from .analysis import (
     validate_expected_keys,
     validate_paired_edit_hashes,
 )
+from .extension_config import ConstructCell, ExtensionConfig
 
 FLOOR_GRID = (0.5000000001, 0.525, 0.55, 0.575, 0.60)
+
+LOCKED_CONSTRUCT_CANDIDATE_EDIT_IDS = tuple(
+    f"dcand_crossfit-{architecture}-seed{seed}"
+    for architecture in ("linear", "mlp", "mka")
+    for seed in range(20)
+)
 
 _SCHEMA = "reviewer_revision.floor_robustness.v1"
 _LOCKED_EXPECTED_PAIRS = 300
@@ -1008,8 +1017,862 @@ def summarize_floor_robustness(
     }
 
 
+_CONSTRUCT_CELL_COLUMNS = ("model_key", "model_id", "task", "layer")
+_CONSTRUCT_REQUIRED_COLUMNS = {
+    *_CONSTRUCT_CELL_COLUMNS,
+    "row_kind",
+    "evaluation_family",
+    "decoder_seed",
+    "label",
+    "group_id",
+    "n_examples",
+    "correct_count",
+    "split_manifest_sha256",
+    "decoder_checkpoint_sha256",
+    "edit_id",
+    "edit_object",
+    "architecture",
+    "candidate_seed",
+    "edit_hash",
+    "status",
+    "failure_stage",
+    "failure_reason",
+}
+_CONSTRUCT_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_CONSTRUCT_EDIT = re.compile(r"dcand_crossfit-(linear|mlp|mka)-seed(0|[1-9]|1[0-9])\Z")
+
+
+@dataclass(frozen=True)
+class _PreparedConstructCell:
+    cell: ConstructCell
+    groups: tuple[str, ...]
+    group_n: np.ndarray
+    baseline_target_correct: np.ndarray
+    baseline_control_correct: np.ndarray
+    post_target_correct: np.ndarray
+    post_control_correct: np.ndarray
+    split_manifest_sha256: str
+
+
+def _require_nonblank_strings(frame: pd.DataFrame, columns: Sequence[str]) -> None:
+    for column in columns:
+        invalid = frame[column].map(
+            lambda value: not isinstance(value, str) or not value.strip()
+        )
+        if invalid.any():
+            bad = frame.index[invalid].tolist()
+            raise AnalysisValidationError(
+                f"construct group rows require nonblank {column}; invalid rows {bad[:10]}"
+            )
+
+
+def _strict_integer_series(
+    frame: pd.DataFrame,
+    column: str,
+    *,
+    minimum: int,
+    allow_integral_float: bool = False,
+) -> pd.Series:
+    converted: list[int] = []
+    invalid: list[Any] = []
+    for index, value in frame[column].items():
+        if isinstance(value, (bool, np.bool_)):
+            invalid.append(index)
+            continue
+        if isinstance(value, (int, np.integer)) or (
+            allow_integral_float
+            and isinstance(value, (float, np.floating))
+            and np.isfinite(value)
+            and float(value).is_integer()
+        ):
+            integer = int(value)
+        else:
+            invalid.append(index)
+            continue
+        if integer < minimum:
+            invalid.append(index)
+            continue
+        converted.append(integer)
+    if invalid:
+        raise AnalysisValidationError(
+            f"construct {column} must contain integers >= {minimum}; "
+            f"invalid rows {invalid[:10]}"
+        )
+    return pd.Series(converted, index=frame.index, dtype=np.int64)
+
+
+def _validate_sha_column(frame: pd.DataFrame, column: str) -> None:
+    invalid = frame[column].map(
+        lambda value: (
+            not isinstance(value, str) or _CONSTRUCT_SHA256.fullmatch(value) is None
+        )
+    )
+    if invalid.any():
+        bad = frame.index[invalid].tolist()
+        raise AnalysisValidationError(
+            f"construct {column} must contain lowercase SHA-256 values; "
+            f"invalid rows {bad[:10]}"
+        )
+
+
+def _validate_construct_group_rows(
+    rows: pd.DataFrame | Path | str | Iterable[Mapping[str, Any]],
+    *,
+    config: ExtensionConfig,
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    frame = load_rows(rows)
+    _require_unique_column_labels(frame)
+    missing = sorted(_CONSTRUCT_REQUIRED_COLUMNS - set(frame.columns))
+    if missing:
+        raise AnalysisValidationError(
+            f"construct group rows are missing required columns: {missing}"
+        )
+    if frame.empty:
+        raise AnalysisValidationError(
+            "construct group rows require explicit coverage of all 12 locked cells"
+        )
+    _require_nonblank_strings(
+        frame,
+        (
+            "model_key",
+            "model_id",
+            "task",
+            "row_kind",
+            "evaluation_family",
+            "status",
+        ),
+    )
+    _strict_integer_series(frame, "layer", minimum=1)
+    decoder_seed = _strict_integer_series(frame, "decoder_seed", minimum=0)
+    if (decoder_seed != 0).any():
+        raise AnalysisValidationError(
+            "construct confirmatory rows require fresh-linear decoder_seed 0"
+        )
+    if (frame["evaluation_family"] != "fresh_linear").any():
+        raise AnalysisValidationError(
+            "construct confirmatory rows require evaluation_family fresh_linear"
+        )
+    if not frame["row_kind"].isin(("baseline", "post_edit", "cell_status")).all():
+        raise AnalysisValidationError(
+            "construct row_kind must be baseline, post_edit, or cell_status"
+        )
+    if not frame["status"].isin(("ok", "failed", "nonestimable")).all():
+        raise AnalysisValidationError("construct group rows contain an invalid status")
+
+    cell_slugs = pd.Series(pd.NA, index=frame.index, dtype="string")
+    for cell in config.all_cells:
+        mask = (
+            (frame["model_key"] == cell.model_key)
+            & (frame["model_id"] == cell.model_id)
+            & (frame["task"] == cell.task)
+            & (frame["layer"] == cell.layer)
+        )
+        cell_slugs.loc[mask] = cell.slug
+    unexpected = cell_slugs.isna()
+    if unexpected.any():
+        sample = frame.loc[unexpected, list(_CONSTRUCT_CELL_COLUMNS)].head(5)
+        raise AnalysisValidationError(
+            "construct group rows contain unexpected cells: "
+            f"{sample.to_dict(orient='records')!r}"
+        )
+    frame["_cell_slug"] = pd.Categorical(
+        cell_slugs,
+        categories=[cell.slug for cell in config.all_cells],
+    )
+    observed_slugs = set(cell_slugs)
+    missing_cells = [
+        cell.slug for cell in config.all_cells if cell.slug not in observed_slugs
+    ]
+    if missing_cells:
+        raise AnalysisValidationError(
+            "construct group rows require exact cell coverage; missing explicit "
+            f"cell records: {missing_cells}"
+        )
+
+    blocked: dict[str, str] = {}
+    for slug, group in frame.groupby("_cell_slug", sort=False, observed=True):
+        statuses = set(group["status"])
+        if statuses == {"ok"}:
+            if (group["row_kind"] == "cell_status").any():
+                raise AnalysisValidationError(
+                    f"construct cell {slug} cannot use cell_status with status ok"
+                )
+            continue
+        if len(group) != 1 or len(statuses) != 1:
+            raise AnalysisValidationError(
+                f"construct cell {slug} requires exactly one explicit non-ok status row"
+            )
+        status_row = group.iloc[0]
+        if status_row["row_kind"] != "cell_status":
+            raise AnalysisValidationError(
+                f"construct cell {slug} non-ok row must use row_kind cell_status"
+            )
+        for field in ("failure_stage", "failure_reason"):
+            value = status_row[field]
+            if not isinstance(value, str) or not value.strip():
+                raise AnalysisValidationError(
+                    f"construct cell {slug} non-ok row requires {field}"
+                )
+        for field in (
+            "label",
+            "group_id",
+            "split_manifest_sha256",
+            "decoder_checkpoint_sha256",
+            "edit_id",
+            "edit_object",
+            "architecture",
+            "candidate_seed",
+            "edit_hash",
+        ):
+            if not pd.isna(status_row[field]):
+                raise AnalysisValidationError(
+                    f"construct cell {slug} non-ok row must leave {field} null"
+                )
+        for field in ("n_examples", "correct_count"):
+            value = status_row[field]
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, (int, np.integer))
+                or int(value) != 0
+            ):
+                raise AnalysisValidationError(
+                    f"construct cell {slug} non-ok row requires integer {field}=0"
+                )
+        blocked[str(slug)] = (
+            f"{status_row['status']}: {status_row['failure_stage']}: "
+            f"{status_row['failure_reason']}"
+        )
+
+    ok = frame.loc[frame["status"] == "ok"]
+    if not ok.empty:
+        if not ok["row_kind"].isin(("baseline", "post_edit")).all():
+            raise AnalysisValidationError(
+                "ok construct rows must be baseline or post_edit"
+            )
+        if not ok["label"].isin(("target", "control")).all():
+            raise AnalysisValidationError(
+                "ok construct label must be target or control"
+            )
+        _require_nonblank_strings(ok, ("label", "group_id"))
+        if ok[["failure_stage", "failure_reason"]].notna().any().any():
+            raise AnalysisValidationError(
+                "ok construct rows must leave failure_stage and failure_reason null"
+            )
+        n_examples = _strict_integer_series(ok, "n_examples", minimum=1)
+        correct_count = _strict_integer_series(ok, "correct_count", minimum=0)
+        if (correct_count > n_examples).any():
+            raise AnalysisValidationError(
+                "construct correct_count cannot exceed n_examples"
+            )
+        _validate_sha_column(ok, "split_manifest_sha256")
+        _validate_sha_column(ok, "decoder_checkpoint_sha256")
+
+        baseline = ok["row_kind"] == "baseline"
+        for column in (
+            "edit_id",
+            "edit_object",
+            "architecture",
+            "candidate_seed",
+            "edit_hash",
+        ):
+            if ok.loc[baseline, column].notna().any():
+                raise AnalysisValidationError(
+                    f"construct baseline rows must leave {column} null"
+                )
+        post = ~baseline
+        _require_nonblank_strings(
+            ok.loc[post],
+            ("edit_id", "edit_object", "architecture", "edit_hash"),
+        )
+        _validate_sha_column(ok.loc[post], "edit_hash")
+        _strict_integer_series(
+            ok.loc[post],
+            "candidate_seed",
+            minimum=0,
+            allow_integral_float=True,
+        )
+
+        edit_key = ok["edit_id"].where(post, "__baseline__")
+        duplicate_columns = [
+            "_cell_slug",
+            "row_kind",
+            "evaluation_family",
+            "decoder_seed",
+            "label",
+            "group_id",
+        ]
+        duplicate_probe = ok[duplicate_columns].copy()
+        duplicate_probe["_edit_key"] = edit_key
+        duplicates = duplicate_probe.duplicated(keep=False)
+        if duplicates.any():
+            raise AnalysisValidationError("duplicate construct group-row key")
+    return frame, blocked
+
+
+def _prepare_construct_cell(
+    frame: pd.DataFrame,
+    cell: ConstructCell,
+) -> _PreparedConstructCell:
+    cell_rows = frame.loc[
+        (frame["_cell_slug"] == cell.slug) & (frame["status"] == "ok")
+    ].copy()
+    if cell_rows.empty:
+        raise AnalysisValidationError(f"construct cell {cell.slug} has no ok rows")
+    split_hashes = set(cell_rows["split_manifest_sha256"])
+    if len(split_hashes) != 1:
+        raise AnalysisValidationError(
+            f"construct cell {cell.slug} has inconsistent split manifest hashes"
+        )
+    baseline = cell_rows.loc[cell_rows["row_kind"] == "baseline"].copy()
+    post = cell_rows.loc[cell_rows["row_kind"] == "post_edit"].copy()
+    if baseline.empty or post.empty:
+        raise AnalysisValidationError(
+            f"construct cell {cell.slug} requires baseline and post-edit rows"
+        )
+    for label in ("target", "control"):
+        hashes = set(
+            baseline.loc[baseline["label"] == label, "decoder_checkpoint_sha256"]
+        )
+        if len(hashes) != 1:
+            raise AnalysisValidationError(
+                f"construct cell {cell.slug} baseline {label} rows must share "
+                "one decoder checkpoint hash"
+            )
+    observed_edits = set(post["edit_id"])
+    if observed_edits != set(LOCKED_CONSTRUCT_CANDIDATE_EDIT_IDS):
+        missing = sorted(set(LOCKED_CONSTRUCT_CANDIDATE_EDIT_IDS) - observed_edits)
+        unexpected = sorted(observed_edits - set(LOCKED_CONSTRUCT_CANDIDATE_EDIT_IDS))
+        raise AnalysisValidationError(
+            f"construct cell {cell.slug} requires the exact 60 candidate edits; "
+            f"missing={missing[:5]}, unexpected={unexpected[:5]}"
+        )
+    for edit_id, group in post.groupby("edit_id", sort=False):
+        match = _CONSTRUCT_EDIT.fullmatch(str(edit_id))
+        if match is None:
+            raise AnalysisValidationError(
+                f"invalid construct edit identity: {edit_id!r}"
+            )
+        expected_architecture = match.group(1)
+        expected_seed = int(match.group(2))
+        if set(group["edit_object"]) != {"dcand_crossfit"}:
+            raise AnalysisValidationError(
+                f"construct edit {edit_id} has an invalid edit object"
+            )
+        if set(group["architecture"]) != {expected_architecture}:
+            raise AnalysisValidationError(
+                f"construct edit {edit_id} has inconsistent architecture"
+            )
+        seeds = {int(value) for value in group["candidate_seed"]}
+        if seeds != {expected_seed}:
+            raise AnalysisValidationError(
+                f"construct edit {edit_id} has inconsistent candidate seed"
+            )
+        if len(set(group["edit_hash"])) != 1:
+            raise AnalysisValidationError(
+                f"construct edit {edit_id} has inconsistent edit hashes"
+            )
+        for label in ("target", "control"):
+            decoder_hashes = set(
+                group.loc[group["label"] == label, "decoder_checkpoint_sha256"]
+            )
+            if len(decoder_hashes) != 1:
+                raise AnalysisValidationError(
+                    f"construct edit {edit_id}/{label} rows must share one "
+                    "decoder checkpoint hash"
+                )
+
+    baseline_groups: dict[str, set[str]] = {}
+    for label in ("target", "control"):
+        label_rows = baseline.loc[baseline["label"] == label]
+        baseline_groups[label] = set(label_rows["group_id"])
+        if not baseline_groups[label]:
+            raise AnalysisValidationError(
+                f"construct cell {cell.slug} has no {label} baseline groups"
+            )
+    if baseline_groups["target"] != baseline_groups["control"]:
+        raise AnalysisValidationError(
+            f"construct cell {cell.slug} baseline target/control groups differ"
+        )
+    groups = tuple(sorted(baseline_groups["target"]))
+
+    def ordered(label_rows: pd.DataFrame) -> pd.DataFrame:
+        indexed = label_rows.set_index("group_id")
+        if not indexed.index.is_unique:
+            raise AnalysisValidationError(
+                f"construct cell {cell.slug} has duplicate group rows"
+            )
+        if set(indexed.index) != set(groups):
+            raise AnalysisValidationError(
+                f"construct cell {cell.slug} has incomplete group coverage"
+            )
+        return indexed.loc[list(groups)]
+
+    baseline_target = ordered(baseline.loc[baseline["label"] == "target"])
+    baseline_control = ordered(baseline.loc[baseline["label"] == "control"])
+    group_n = baseline_target["n_examples"].to_numpy(dtype=np.float64)
+    if not np.array_equal(
+        baseline_control["n_examples"].to_numpy(dtype=np.float64), group_n
+    ):
+        raise AnalysisValidationError(
+            f"construct cell {cell.slug} baseline label group sizes differ"
+        )
+
+    post_target = np.empty(
+        (len(LOCKED_CONSTRUCT_CANDIDATE_EDIT_IDS), len(groups)), dtype=np.float64
+    )
+    post_control = np.empty_like(post_target)
+    for edit_index, edit_id in enumerate(LOCKED_CONSTRUCT_CANDIDATE_EDIT_IDS):
+        edit_rows = post.loc[post["edit_id"] == edit_id]
+        for label, destination in (
+            ("target", post_target),
+            ("control", post_control),
+        ):
+            selected = ordered(edit_rows.loc[edit_rows["label"] == label])
+            if not np.array_equal(
+                selected["n_examples"].to_numpy(dtype=np.float64), group_n
+            ):
+                raise AnalysisValidationError(
+                    f"construct cell {cell.slug}/{edit_id}/{label} group sizes differ"
+                )
+            destination[edit_index] = selected["correct_count"].to_numpy(
+                dtype=np.float64
+            )
+    return _PreparedConstructCell(
+        cell=cell,
+        groups=groups,
+        group_n=group_n,
+        baseline_target_correct=baseline_target["correct_count"].to_numpy(
+            dtype=np.float64
+        ),
+        baseline_control_correct=baseline_control["correct_count"].to_numpy(
+            dtype=np.float64
+        ),
+        post_target_correct=post_target,
+        post_control_correct=post_control,
+        split_manifest_sha256=next(iter(split_hashes)),
+    )
+
+
+def _construct_point_endpoints(
+    cell: _PreparedConstructCell,
+) -> tuple[dict[str, float] | None, dict[str, float]]:
+    total = float(cell.group_n.sum())
+    target_baseline = float(cell.baseline_target_correct.sum() / total)
+    control_baseline = float(cell.baseline_control_correct.sum() / total)
+    baselines = {
+        "target_accuracy": target_baseline,
+        "control_accuracy": control_baseline,
+    }
+    if target_baseline <= 0.5 or control_baseline <= 0.5:
+        return None, baselines
+    target_post = cell.post_target_correct.sum(axis=1) / total
+    control_post = cell.post_control_correct.sum(axis=1) / total
+    endpoints = {
+        "median_target_post_edit_accuracy": float(np.median(target_post)),
+        "median_target_recovery_ratio": float(
+            np.median((target_post - 0.5) / (target_baseline - 0.5))
+        ),
+        "median_control_retention_ratio": float(
+            np.median((control_post - 0.5) / (control_baseline - 0.5))
+        ),
+    }
+    return endpoints, baselines
+
+
+def holm_adjust(p_values: Mapping[str, float]) -> dict[str, float]:
+    """Return deterministic Holm step-down adjusted p-values."""
+
+    if not p_values:
+        raise AnalysisValidationError("Holm adjustment requires p-values")
+    checked: list[tuple[str, float]] = []
+    for key, value in p_values.items():
+        if not isinstance(key, str) or not key:
+            raise AnalysisValidationError("Holm p-value keys must be nonblank strings")
+        if isinstance(value, (bool, np.bool_)) or not isinstance(
+            value, (int, float, np.integer, np.floating)
+        ):
+            raise AnalysisValidationError(f"Holm p-value for {key} is not numeric")
+        numeric = float(value)
+        if not np.isfinite(numeric) or not 0.0 <= numeric <= 1.0:
+            raise AnalysisValidationError(f"Holm p-value for {key} is outside [0, 1]")
+        checked.append((key, numeric))
+    ordered = sorted(checked, key=lambda item: (item[1], item[0]))
+    family_size = len(ordered)
+    running = 0.0
+    adjusted: dict[str, float] = {}
+    for rank, (key, value) in enumerate(ordered):
+        candidate = min(1.0, (family_size - rank) * value)
+        running = max(running, candidate)
+        adjusted[key] = running
+    return adjusted
+
+
+def _task_order(config: ExtensionConfig) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(cell.task for cell in config.confirmatory_cells))
+
+
+def _resample_hash_header(task: str, groups: Sequence[str]) -> bytes:
+    payload = bytearray(task.encode("utf-8"))
+    payload.extend(b"\0")
+    for group in groups:
+        encoded = group.encode("utf-8")
+        payload.extend(len(encoded).to_bytes(8, "little"))
+        payload.extend(encoded)
+    return bytes(payload)
+
+
+def _task_bootstrap_seed(seed: int, task: str) -> int:
+    digest = hashlib.sha256(
+        f"reviewer_revision.construct_panel.PCG64.v1\0{seed}\0{task}".encode()
+    ).digest()
+    return int.from_bytes(digest[:16], "little")
+
+
+def _construct_bootstrap(
+    prepared: Mapping[str, _PreparedConstructCell],
+    *,
+    config: ExtensionConfig,
+) -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, str | None],
+    dict[str, int],
+]:
+    draws = config.bootstrap_draws
+    distributions: dict[str, dict[str, np.ndarray]] = {}
+    invalid_counts: dict[str, dict[str, int]] = {}
+    task_hashes: dict[str, str | None] = {}
+    task_seeds: dict[str, int] = {}
+    for slug in prepared:
+        distributions[slug] = {
+            "accuracy": np.empty(draws, dtype=np.float64),
+            "target_recovery_ratio": np.empty(draws, dtype=np.float64),
+            "control_retention_ratio": np.empty(draws, dtype=np.float64),
+        }
+        invalid_counts[slug] = {
+            "target_baseline_at_or_below_chance": 0,
+            "control_baseline_at_or_below_chance": 0,
+        }
+
+    for task in _task_order(config):
+        task_seed = _task_bootstrap_seed(config.bootstrap_seed, task)
+        task_seeds[task] = task_seed
+        generator = np.random.Generator(np.random.PCG64(task_seed))
+        task_cells = [
+            cell
+            for cell in config.confirmatory_cells
+            if cell.task == task and cell.slug in prepared
+        ]
+        if not task_cells:
+            task_hashes[task] = None
+            continue
+        reference = prepared[task_cells[0].slug]
+        for cell in task_cells[1:]:
+            candidate = prepared[cell.slug]
+            if candidate.groups != reference.groups or not np.array_equal(
+                candidate.group_n, reference.group_n
+            ):
+                raise AnalysisValidationError(
+                    f"construct task {task} models do not share the same shared group universe"
+                )
+        group_count = len(reference.groups)
+        hasher = hashlib.sha256(_resample_hash_header(task, reference.groups))
+        batch_size = 256
+        for start in range(0, draws, batch_size):
+            stop = min(draws, start + batch_size)
+            size = stop - start
+            sampled = generator.integers(
+                0,
+                group_count,
+                size=(size, group_count),
+                dtype=np.int32,
+            )
+            weights = np.zeros((size, group_count), dtype=np.int32)
+            rows_index = np.repeat(np.arange(size, dtype=np.int32), group_count)
+            np.add.at(weights, (rows_index, sampled.reshape(-1)), 1)
+            hasher.update(weights.astype("<i4", copy=False).tobytes(order="C"))
+            weights_float = weights.astype(np.float64)
+            for cell in task_cells:
+                values = prepared[cell.slug]
+                denominator = weights_float @ values.group_n
+                target_baseline = (
+                    weights_float @ values.baseline_target_correct
+                ) / denominator
+                control_baseline = (
+                    weights_float @ values.baseline_control_correct
+                ) / denominator
+                target_post = (
+                    weights_float @ values.post_target_correct.T
+                ) / denominator[:, None]
+                control_post = (
+                    weights_float @ values.post_control_correct.T
+                ) / denominator[:, None]
+                endpoint = distributions[cell.slug]
+                endpoint["accuracy"][start:stop] = np.median(target_post, axis=1)
+                target_valid = target_baseline > 0.5
+                target_ratio = np.full(size, -np.inf, dtype=np.float64)
+                if target_valid.any():
+                    target_ratio[target_valid] = np.median(
+                        (target_post[target_valid] - 0.5)
+                        / (target_baseline[target_valid, None] - 0.5),
+                        axis=1,
+                    )
+                endpoint["target_recovery_ratio"][start:stop] = target_ratio
+                invalid_counts[cell.slug]["target_baseline_at_or_below_chance"] += int(
+                    (~target_valid).sum()
+                )
+                control_valid = control_baseline > 0.5
+                control_ratio = np.full(size, -np.inf, dtype=np.float64)
+                if control_valid.any():
+                    control_ratio[control_valid] = np.median(
+                        (control_post[control_valid] - 0.5)
+                        / (control_baseline[control_valid, None] - 0.5),
+                        axis=1,
+                    )
+                endpoint["control_retention_ratio"][start:stop] = control_ratio
+                invalid_counts[cell.slug]["control_baseline_at_or_below_chance"] += int(
+                    (~control_valid).sum()
+                )
+        task_hashes[task] = hasher.hexdigest()
+
+    thresholds = dict(config.recovery_thresholds)
+    outputs: dict[str, dict[str, Any]] = {}
+    for slug, endpoint in distributions.items():
+        endpoint_p_values: dict[str, float] = {}
+        lower_bounds: dict[str, float | None] = {}
+        lower_bound_finite: dict[str, bool] = {}
+        for name, values in endpoint.items():
+            threshold = thresholds[name]
+            endpoint_p_values[name] = float(
+                (1 + np.count_nonzero(values <= threshold)) / (draws + 1)
+            )
+            with np.errstate(invalid="ignore"):
+                lower = float(
+                    np.quantile(
+                        values,
+                        config.alpha,
+                        method=config.bootstrap_quantile_method,
+                    )
+                )
+            finite = bool(np.isfinite(lower))
+            lower_bounds[name] = lower if finite else None
+            lower_bound_finite[name] = finite
+        outputs[slug] = {
+            "endpoint_p_values": endpoint_p_values,
+            "internal_cell_p_value": max(endpoint_p_values.values()),
+            "marginal_lower_bounds": lower_bounds,
+            "marginal_lower_bound_finite": lower_bound_finite,
+            "invalid_bootstrap_draws": invalid_counts[slug],
+        }
+    return outputs, task_hashes, task_seeds
+
+
+def _point_threshold_decision(
+    endpoints: Mapping[str, float],
+    thresholds: Mapping[str, float],
+) -> tuple[dict[str, bool], bool]:
+    decisions = {
+        "accuracy": endpoints["median_target_post_edit_accuracy"]
+        >= thresholds["accuracy"],
+        "target_recovery_ratio": endpoints["median_target_recovery_ratio"]
+        >= thresholds["target_recovery_ratio"],
+        "control_retention_ratio": endpoints["median_control_retention_ratio"]
+        >= thresholds["control_retention_ratio"],
+    }
+    return decisions, all(decisions.values())
+
+
+def classify_construct_panel(
+    rows: pd.DataFrame | Path | str | Iterable[Mapping[str, Any]],
+    *,
+    config: ExtensionConfig,
+) -> dict[str, Any]:
+    """Classify the fixed 11-cell construct panel from group sufficient statistics."""
+
+    if not isinstance(config, ExtensionConfig):
+        raise TypeError("config must be an ExtensionConfig")
+    config.validate()
+    frame, blocked = _validate_construct_group_rows(rows, config=config)
+    prepared: dict[str, _PreparedConstructCell] = {}
+    preparation_failures: dict[str, str] = {}
+    for cell in config.all_cells:
+        if cell.slug in blocked:
+            preparation_failures[cell.slug] = blocked[cell.slug]
+            continue
+        prepared[cell.slug] = _prepare_construct_cell(frame, cell)
+
+    confirmatory_prepared = {
+        cell.slug: prepared[cell.slug]
+        for cell in config.confirmatory_cells
+        if cell.slug in prepared
+    }
+    bootstrap, task_hashes, task_seeds = _construct_bootstrap(
+        confirmatory_prepared,
+        config=config,
+    )
+    thresholds = dict(config.recovery_thresholds)
+    cells: dict[str, dict[str, Any]] = {}
+    raw_cell_p_values: dict[str, float] = {}
+    point_pass: dict[str, bool] = {}
+
+    for cell in config.all_cells:
+        confirmatory = cell != config.pilot
+        base_record: dict[str, Any] = {
+            "cell": {
+                "model_key": cell.model_key,
+                "model_id": cell.model_id,
+                "task": cell.task,
+                "layer": cell.layer,
+            },
+            "confirmatory": confirmatory,
+            "thresholds": thresholds,
+        }
+        if cell.slug not in prepared:
+            record = {
+                **base_record,
+                "status": "nonestimable",
+                "nonestimable_reason": preparation_failures[cell.slug],
+            }
+            if confirmatory:
+                record.update(
+                    {
+                        "passes_locked_point_thresholds": False,
+                        "internal_cell_p_value": 1.0,
+                    }
+                )
+                raw_cell_p_values[cell.slug] = 1.0
+                point_pass[cell.slug] = False
+            else:
+                record["inference_mode"] = "descriptive_only"
+            cells[cell.slug] = record
+            continue
+        prepared_cell = prepared[cell.slug]
+        endpoints, baselines = _construct_point_endpoints(prepared_cell)
+        record = {
+            **base_record,
+            "n_groups": len(prepared_cell.groups),
+            "n_candidate_edits": len(LOCKED_CONSTRUCT_CANDIDATE_EDIT_IDS),
+            "baseline_accuracies": baselines,
+            "split_manifest_sha256": prepared_cell.split_manifest_sha256,
+        }
+        if endpoints is None:
+            record.update(
+                {
+                    "status": "nonestimable",
+                    "nonestimable_reason": (
+                        "target or control fresh-linear baseline is at or below chance"
+                    ),
+                }
+            )
+            if confirmatory:
+                record.update(
+                    {
+                        "passes_locked_point_thresholds": False,
+                        "internal_cell_p_value": 1.0,
+                    }
+                )
+                raw_cell_p_values[cell.slug] = 1.0
+                point_pass[cell.slug] = False
+            else:
+                record["inference_mode"] = "descriptive_only"
+            cells[cell.slug] = record
+            continue
+        endpoint_decisions, passes_points = _point_threshold_decision(
+            endpoints, thresholds
+        )
+        record.update(
+            {
+                "status": "ok",
+                "endpoints": endpoints,
+                "point_threshold_decisions": endpoint_decisions,
+                "passes_locked_point_thresholds": passes_points,
+            }
+        )
+        if not confirmatory:
+            record["inference_mode"] = "descriptive_only"
+            cells[cell.slug] = record
+            continue
+        inference = bootstrap[cell.slug]
+        record.update(
+            {
+                **inference,
+                "within_cell_combination": "intersection_union_max_endpoint_p",
+                "task_resample_sha256": task_hashes[cell.task],
+                "lower_bound_scope": "marginal",
+                "lower_bound_multiplicity_adjusted": False,
+                "lower_bound_simultaneous": False,
+            }
+        )
+        raw_cell_p_values[cell.slug] = inference["internal_cell_p_value"]
+        point_pass[cell.slug] = passes_points
+        cells[cell.slug] = record
+
+    if len(raw_cell_p_values) != config.family_size:
+        raise AnalysisValidationError(
+            "construct panel did not preserve the fixed 11-cell inference family"
+        )
+    adjusted = holm_adjust(raw_cell_p_values)
+    for cell in config.confirmatory_cells:
+        record = cells[cell.slug]
+        adjusted_p = adjusted[cell.slug]
+        passes_inference = adjusted_p <= config.alpha
+        record["holm_adjusted_cell_p_value"] = adjusted_p
+        record["passes_holm_adjusted_inference"] = passes_inference
+        record["passes_locked_confirmatory_rule"] = (
+            point_pass[cell.slug] and passes_inference
+        )
+
+    return {
+        "schema": "reviewer_revision.construct_panel_inference.v1",
+        "schema_version": 1,
+        "status": "ok",
+        "pilot": dict(cells[config.pilot.slug]),
+        "confirmatory_cell_count": len(config.confirmatory_cells),
+        "nonestimable_confirmatory_cell_count": sum(
+            cells[cell.slug]["status"] == "nonestimable"
+            for cell in config.confirmatory_cells
+        ),
+        "passing_confirmatory_cell_count": sum(
+            bool(cells[cell.slug]["passes_locked_confirmatory_rule"])
+            for cell in config.confirmatory_cells
+        ),
+        "cells": cells,
+        "bootstrap": {
+            "draws": config.bootstrap_draws,
+            "seed": config.bootstrap_seed,
+            "bit_generator": config.bootstrap_bit_generator,
+            "resampling_unit": "final_test_group_id",
+            "shared_resamples_across_models_within_task": True,
+            "resample_algorithm": "PCG64 integers followed by exact multiplicity counts",
+            "task_seed_derivation": (
+                "first 128 little-endian bits of SHA256("
+                "reviewer_revision.construct_panel.PCG64.v1\\0seed\\0task)"
+            ),
+            "task_seeds": task_seeds,
+            "task_resample_sha256": task_hashes,
+        },
+        "multiplicity": {
+            "method": "holm_one_sided",
+            "family_size": config.family_size,
+            "alpha": config.alpha,
+        },
+        "lower_bounds": {
+            "confidence_level": config.lower_bound_confidence_level,
+            "quantile": config.alpha,
+            "quantile_method": config.bootstrap_quantile_method,
+            "scope": config.lower_bound_scope,
+            "multiplicity_adjusted": config.lower_bound_multiplicity_adjusted,
+            "simultaneous": config.lower_bound_simultaneous,
+        },
+        "endpoint_tail_p_value": config.endpoint_tail_p_value,
+        "within_cell_combination": config.within_cell_combination,
+    }
+
+
 __all__ = [
     "FLOOR_GRID",
+    "LOCKED_CONSTRUCT_CANDIDATE_EDIT_IDS",
+    "classify_construct_panel",
+    "holm_adjust",
     "raw_target_drop",
     "summarize_floor_robustness",
     "target_damage_at_floor",
