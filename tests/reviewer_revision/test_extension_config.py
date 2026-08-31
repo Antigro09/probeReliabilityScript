@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -93,6 +94,56 @@ def test_extension_config_and_nested_thresholds_are_immutable() -> None:
         config.bootstrap_draws = 1  # type: ignore[misc]
     with pytest.raises(TypeError):
         config.recovery_thresholds["accuracy"] = 0.0  # type: ignore[index]
+
+
+def test_extension_config_record_is_portable_json_and_detached() -> None:
+    config = load_extension_config(SPEC_PATH)
+
+    record = config.to_record()
+    expected = {
+        "config_hash": config.config_hash,
+        "base_run": (
+            "results/reviewer_revision_2026_08/20260830T024520Z-7aab3eb"
+        ),
+        "pilot": {
+            "model_key": PILOT.model_key,
+            "model_id": PILOT.model_id,
+            "task": PILOT.task,
+            "layer": PILOT.layer,
+        },
+        "confirmatory_cells": [
+            {
+                "model_key": cell.model_key,
+                "model_id": cell.model_id,
+                "task": cell.task,
+                "layer": cell.layer,
+            }
+            for cell in CONFIRMATORY_CELLS
+        ],
+        "recovery_thresholds": {
+            "accuracy": 0.55,
+            "target_recovery_ratio": 0.50,
+            "control_retention_ratio": 0.80,
+        },
+        "bootstrap_draws": 10_000,
+        "bootstrap_seed": 20260830,
+        "disk_reserve_gib": 8.0,
+    }
+
+    assert record == expected
+    assert "source_path" not in record
+    assert json.loads(json.dumps(record, sort_keys=True)) == record
+    assert re.fullmatch(r"[0-9a-f]{64}", sha256_json(record))
+
+    record["pilot"]["model_key"] = "mutated"
+    record["confirmatory_cells"][0]["layer"] = 999
+    record["confirmatory_cells"].append(record["pilot"])
+    record["recovery_thresholds"]["accuracy"] = 0.0
+
+    assert config.pilot == PILOT
+    assert config.confirmatory_cells == CONFIRMATORY_CELLS
+    assert config.recovery_thresholds["accuracy"] == 0.55
+    assert config.to_record() == expected
 
 
 def test_extension_config_hash_uses_repository_canonical_json_convention(

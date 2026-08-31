@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 import yaml
 
@@ -84,6 +85,30 @@ class ExtensionConfig:
     @property
     def all_cells(self) -> tuple[ConstructCell, ...]:
         return (self.pilot, *self.confirmatory_cells)
+
+    def to_record(self) -> dict[str, Any]:
+        """Return a detached, portable JSON record for manifests and resumes."""
+
+        def cell_record(cell: ConstructCell) -> dict[str, str | int]:
+            return {
+                "model_key": cell.model_key,
+                "model_id": cell.model_id,
+                "task": cell.task,
+                "layer": cell.layer,
+            }
+
+        return {
+            "config_hash": self.config_hash,
+            "base_run": self.base_run.as_posix(),
+            "pilot": cell_record(self.pilot),
+            "confirmatory_cells": [
+                cell_record(cell) for cell in self.confirmatory_cells
+            ],
+            "recovery_thresholds": dict(self.recovery_thresholds),
+            "bootstrap_draws": self.bootstrap_draws,
+            "bootstrap_seed": self.bootstrap_seed,
+            "disk_reserve_gib": self.disk_reserve_gib,
+        }
 
     def validate(self) -> None:
         if not isinstance(self.source_path, Path) or not self.source_path.is_absolute():
@@ -210,7 +235,7 @@ def _require_exact_keys(
             f"{location} is missing required fields: {names}"
         )
     if unexpected:
-        names = ", ".join(sorted((repr(key) for key in unexpected)))
+        names = ", ".join(sorted(repr(key) for key in unexpected))
         raise ExtensionConfigError(f"{location} has unexpected fields: {names}")
 
 
