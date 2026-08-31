@@ -829,9 +829,11 @@ def _floor_summary(
         "block_gap_sign_counts": block_signs,
         "hierarchical_bootstrap_reported": False,
         "hierarchical_bootstrap_omission_reason": (
-            "Whole cells can disappear at higher floors; the existing bootstrap "
-            "helper reports an equal-cell point estimate, not this equal-block "
-            "available-case point estimate."
+            "Floor-specific hierarchical intervals were not preregistered for "
+            "this post-hoc curve. To avoid multiplying exploratory interval "
+            "estimates, this sensitivity reports the available-case point "
+            "estimate, coverage, and exact block sign-flip result; the raw-row "
+            "hierarchical interval is reported separately."
         ),
     }
 
