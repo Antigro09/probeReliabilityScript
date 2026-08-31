@@ -17,6 +17,14 @@ from src.reviewer_revision.extension_analysis import (
     target_damage_at_floor,
 )
 
+_PLAN_COUNTS = {"expected_pairs": 2, "expected_cells": 2, "expected_blocks": 2}
+_HIERARCHY_COUNTS = {
+    "expected_pairs": 3,
+    "expected_cells": 3,
+    "expected_blocks": 2,
+}
+_ONE_COUNTS = {"expected_pairs": 1, "expected_cells": 1, "expected_blocks": 1}
+
 
 def _pair_rows(
     *,
@@ -65,9 +73,8 @@ def _plan_fixture_rows() -> list[dict[str, object]]:
             task="sst2",
             layer=6,
             pair_seed=0,
-            matched=(0.54, 0.34),
-            split=(0.54, 0.44),
-            status="pre_target_below_floor",
+            matched=(0.64, 0.44),
+            split=(0.64, 0.54),
         )
     )
     return rows
@@ -93,6 +100,20 @@ def _real_hierarchy_fixture_rows() -> list[dict[str, object]]:
             )
         )
     return rows
+
+
+def _alterrep_keys(
+    rows: list[dict[str, object]],
+) -> list[tuple[object, ...]]:
+    columns = (
+        "model_key",
+        "task",
+        "layer",
+        "pair_seed",
+        "method",
+        "condition",
+    )
+    return [tuple(row[column] for column in columns) for row in rows]
 
 
 def test_public_row_helpers_use_raw_drop_and_exact_floor_boundaries() -> None:
@@ -131,7 +152,7 @@ def test_target_damage_helper_requires_exact_chance() -> None:
 
 def test_floor_robustness_includes_every_raw_drop_pair() -> None:
     summary = summarize_floor_robustness(
-        pd.DataFrame(_plan_fixture_rows()), draws=200, seed=7
+        pd.DataFrame(_plan_fixture_rows()), draws=200, seed=7, **_PLAN_COUNTS
     )
 
     raw = summary["full_case_raw_drop"]
@@ -144,11 +165,18 @@ def test_floor_robustness_includes_every_raw_drop_pair() -> None:
     assert raw["gap"] == pytest.approx(0.20)
     assert raw["post_hoc_sensitivity"] is True
     assert raw["exact_sign_flip"]["n_blocks"] == 2
+    assert summary["validation"]["completeness_mode"] == "expected_counts_only"
+    assert summary["validation"]["external_key_universe_checked"] is False
+    assert summary["validation"]["keys_complete"] is None
+    assert summary["validation"]["expected_count_source"] == "explicit_overrides"
 
 
 def test_raw_drop_uses_equal_model_task_blocks_not_equal_cells() -> None:
     summary = summarize_floor_robustness(
-        _real_hierarchy_fixture_rows(), draws=50, seed=17
+        _real_hierarchy_fixture_rows(),
+        draws=50,
+        seed=17,
+        **_HIERARCHY_COUNTS,
     )
 
     raw = summary["raw_drop"]
@@ -158,10 +186,112 @@ def test_raw_drop_uses_equal_model_task_blocks_not_equal_cells() -> None:
     assert raw["gap"] != pytest.approx((0.2 + 0.4 + 0.8) / 3.0)
 
 
-def test_partial_identification_contains_available_case_gap() -> None:
-    bounds = summarize_floor_robustness(_plan_fixture_rows(), draws=40, seed=7)[
-        "partial_identification"
+def test_locked_default_counts_reject_a_small_observed_derived_universe() -> None:
+    with pytest.raises(AnalysisValidationError, match="expected 300 pairs"):
+        summarize_floor_robustness(_plan_fixture_rows(), draws=10, seed=1)
+
+
+def test_external_key_universe_is_reported_as_the_completeness_basis() -> None:
+    rows = _plan_fixture_rows()
+    summary = summarize_floor_robustness(
+        rows,
+        expected_alterrep_keys=_alterrep_keys(rows),
+        draws=20,
+        seed=5,
+        **_PLAN_COUNTS,
+    )
+
+    validation = summary["validation"]
+    assert validation["completeness_mode"] == "external_key_universe"
+    assert validation["external_key_universe_checked"] is True
+    assert validation["keys_complete"] is True
+    assert validation["expected_key_count"] == 4
+    assert validation["observed_derived_key_universe"] is False
+
+
+def test_external_key_universe_rejects_a_deleted_whole_pair() -> None:
+    planned = _plan_fixture_rows()
+    observed = [row for row in planned if row["model_key"] != "gpt2"]
+
+    with pytest.raises(AnalysisValidationError, match="missing expected keys"):
+        summarize_floor_robustness(
+            observed,
+            expected_alterrep_keys=_alterrep_keys(planned),
+            draws=10,
+            seed=1,
+            **_PLAN_COUNTS,
+        )
+
+
+def test_expected_counts_reject_a_deleted_whole_cell() -> None:
+    rows = _real_hierarchy_fixture_rows()
+    observed = [
+        row for row in rows if not (row["model_key"] == "model-a" and row["layer"] == 2)
     ]
+
+    with pytest.raises(AnalysisValidationError, match="expected 3 cells"):
+        summarize_floor_robustness(
+            observed,
+            draws=10,
+            seed=1,
+            expected_pairs=2,
+            expected_cells=3,
+            expected_blocks=2,
+        )
+
+
+def test_expected_counts_reject_a_deleted_whole_block() -> None:
+    rows = _real_hierarchy_fixture_rows()
+    observed = [row for row in rows if row["model_key"] != "model-b"]
+
+    with pytest.raises(AnalysisValidationError, match="expected 2 model-task blocks"):
+        summarize_floor_robustness(
+            observed,
+            draws=10,
+            seed=1,
+            expected_pairs=2,
+            expected_cells=2,
+            expected_blocks=2,
+        )
+
+
+def test_external_key_universe_rejects_same_count_replacement_key() -> None:
+    planned = _plan_fixture_rows()
+    observed = [dict(row) for row in planned]
+    for row in observed:
+        if row["model_key"] == "gpt2":
+            row["model_key"] = "replacement-model"
+
+    with pytest.raises(
+        AnalysisValidationError, match="missing expected keys.*unexpected observed keys"
+    ):
+        summarize_floor_robustness(
+            observed,
+            expected_alterrep_keys=_alterrep_keys(planned),
+            draws=10,
+            seed=1,
+            **_PLAN_COUNTS,
+        )
+
+
+def test_floor_sign_flip_uses_declared_expected_block_count() -> None:
+    rows = _plan_fixture_rows()
+    for row in rows:
+        if row["model_key"] == "gpt2":
+            row["target_acc_pre"] = 0.54
+            row["target_acc_post"] = 0.50
+            row["status"] = "pre_target_below_floor"
+
+    with pytest.raises(
+        AnalysisValidationError, match="sign-flip test expected 2 blocks, observed 1"
+    ):
+        summarize_floor_robustness(rows, draws=10, seed=1, **_PLAN_COUNTS)
+
+
+def test_partial_identification_contains_available_case_gap() -> None:
+    bounds = summarize_floor_robustness(
+        _plan_fixture_rows(), draws=40, seed=7, **_PLAN_COUNTS
+    )["partial_identification"]
 
     assert bounds["missing_pair_gap_domain"] == [-1.0, 1.0]
     assert bounds["lower"] <= bounds["available_case_gap"] <= bounds["upper"]
@@ -190,9 +320,14 @@ def test_partial_identification_keeps_wholly_missing_cells_in_bounds() -> None:
         )
     )
 
-    bounds = summarize_floor_robustness(rows, draws=30, seed=3)[
-        "partial_identification"
-    ]
+    bounds = summarize_floor_robustness(
+        rows,
+        draws=30,
+        seed=3,
+        expected_pairs=2,
+        expected_cells=2,
+        expected_blocks=1,
+    )["partial_identification"]
 
     assert bounds["observed_pairs"] == 1
     assert bounds["missing_pairs"] == 1
@@ -224,7 +359,14 @@ def test_floor_curve_excludes_a_pair_symmetrically() -> None:
         )
     )
 
-    summary = summarize_floor_robustness(rows, draws=30, seed=2)
+    summary = summarize_floor_robustness(
+        rows,
+        draws=30,
+        seed=2,
+        expected_pairs=2,
+        expected_cells=1,
+        expected_blocks=1,
+    )
     at_locked_floor = next(
         row for row in summary["floor_curve"] if row["floor"] == 0.55
     )
@@ -253,7 +395,7 @@ def test_score_null_from_control_denominator_is_retained() -> None:
     )
     rows[0]["status"] = "pre_control_below_floor"
 
-    summary = summarize_floor_robustness(rows, draws=20, seed=9)
+    summary = summarize_floor_robustness(rows, draws=20, seed=9, **_ONE_COUNTS)
     locked = next(row for row in summary["floor_curve"] if row["floor"] == 0.55)
 
     assert summary["validation"]["score_null_rows"] == 1
@@ -287,7 +429,7 @@ def test_pair_and_edit_hash_validation(
     mutate(rows)
 
     with pytest.raises(AnalysisValidationError, match=message):
-        summarize_floor_robustness(rows, draws=10, seed=1)
+        summarize_floor_robustness(rows, draws=10, seed=1, **_ONE_COUNTS)
 
 
 @pytest.mark.parametrize("status", ["failed", "invalid"])
@@ -296,7 +438,7 @@ def test_hard_failures_are_rejected(status: str) -> None:
     rows[0]["status"] = status
 
     with pytest.raises(AnalysisValidationError, match="hard-failure"):
-        summarize_floor_robustness(rows, draws=10, seed=1)
+        summarize_floor_robustness(rows, draws=10, seed=1, **_PLAN_COUNTS)
 
 
 @pytest.mark.parametrize(
@@ -340,7 +482,89 @@ def test_invalid_schema_values_are_rejected(
     mutate(rows)
 
     with pytest.raises(AnalysisValidationError, match=message):
-        summarize_floor_robustness(rows, draws=10, seed=1)
+        summarize_floor_robustness(rows, draws=10, seed=1, **_PLAN_COUNTS)
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("model_key", 123),
+        ("task", 456),
+        ("method", 789),
+        ("condition", 101),
+        ("status", 112),
+        ("edit_hash", 123),
+        ("edit_hash", np.inf),
+    ],
+)
+def test_text_schema_fields_require_actual_nonblank_strings(
+    field: str, value: object
+) -> None:
+    rows = _plan_fixture_rows()
+    for row in rows:
+        row[field] = value
+
+    with pytest.raises(AnalysisValidationError, match=rf"{field!r}.*nonblank strings"):
+        summarize_floor_robustness(rows, draws=10, seed=1, **_PLAN_COUNTS)
+
+
+@pytest.mark.parametrize(
+    "field, value, message",
+    [
+        ("layer", True, "positive non-boolean integer"),
+        ("layer", 1.0, "positive non-boolean integer"),
+        ("layer", 1.5, "positive non-boolean integer"),
+        ("layer", 0, "positive non-boolean integer"),
+        ("pair_seed", False, "nonnegative non-boolean integer"),
+        ("pair_seed", 0.0, "nonnegative non-boolean integer"),
+        ("pair_seed", 0.5, "nonnegative non-boolean integer"),
+        ("pair_seed", -1, "nonnegative non-boolean integer"),
+    ],
+)
+def test_integral_keys_reject_bools_floats_and_out_of_domain_values(
+    field: str, value: object, message: str
+) -> None:
+    rows = _plan_fixture_rows()
+    for row in rows:
+        row[field] = value
+
+    with pytest.raises(AnalysisValidationError, match=message):
+        summarize_floor_robustness(rows, draws=10, seed=1, **_PLAN_COUNTS)
+
+
+def test_numpy_large_integer_pair_seed_is_preserved_exactly() -> None:
+    large_seed = np.int64(2**53 + 1)
+    rows = _pair_rows(
+        model="model-a",
+        task="task-a",
+        layer=np.int64(1),
+        pair_seed=large_seed,
+        matched=(0.54, 0.50),
+        split=(0.54, 0.52),
+        status="pre_target_below_floor",
+    )
+    rows.extend(
+        _pair_rows(
+            model="model-a",
+            task="task-a",
+            layer=np.int64(1),
+            pair_seed=np.int64(0),
+            matched=(0.8, 0.65),
+            split=(0.8, 0.725),
+        )
+    )
+
+    summary = summarize_floor_robustness(
+        rows,
+        draws=10,
+        seed=1,
+        expected_pairs=2,
+        expected_cells=1,
+        expected_blocks=1,
+    )
+    locked = next(row for row in summary["floor_curve"] if row["floor"] == 0.55)
+
+    assert locked["excluded_pair_keys"] == [["model-a", "task-a", 1, 2**53 + 1]]
 
 
 def test_model_task_and_measurement_aliases_are_accepted() -> None:
@@ -354,7 +578,7 @@ def test_model_task_and_measurement_aliases_are_accepted() -> None:
         }
     )
 
-    summary = summarize_floor_robustness(rows, draws=20, seed=5)
+    summary = summarize_floor_robustness(rows, draws=20, seed=5, **_PLAN_COUNTS)
 
     assert summary["raw_drop"]["pairs"] == 2
     assert summary["validation"]["column_aliases"]["model_key"] == "model"
@@ -365,8 +589,10 @@ def test_summary_is_shuffle_rng_deterministic_and_json_serializable() -> None:
     rows = pd.DataFrame(_real_hierarchy_fixture_rows())
     shuffled = rows.sample(frac=1.0, random_state=123).reset_index(drop=True)
 
-    first = summarize_floor_robustness(rows, draws=80, seed=19)
-    second = summarize_floor_robustness(shuffled, draws=80, seed=19)
+    first = summarize_floor_robustness(rows, draws=80, seed=19, **_HIERARCHY_COUNTS)
+    second = summarize_floor_robustness(
+        shuffled, draws=80, seed=19, **_HIERARCHY_COUNTS
+    )
 
     assert first == second
     assert first["schema"] == "reviewer_revision.floor_robustness.v1"
@@ -382,11 +608,13 @@ def test_path_input_records_content_hash(tmp_path: Path) -> None:
     payload = json.dumps(_plan_fixture_rows(), sort_keys=True)
     path.write_text(payload, encoding="utf-8")
 
-    summary = summarize_floor_robustness(path, draws=20, seed=4)
+    summary = summarize_floor_robustness(path, draws=20, seed=4, **_PLAN_COUNTS)
 
     assert summary["provenance"]["input_kind"] == "path"
     assert (
         summary["provenance"]["source_sha256"]
         == hashlib.sha256(payload.encode("utf-8")).hexdigest()
     )
-    assert summary["provenance"]["source_path"] == str(path.resolve())
+    assert summary["provenance"]["source_name"] == path.name
+    assert "source_path" not in summary["provenance"]
+    assert str(tmp_path.resolve()) not in json.dumps(summary, sort_keys=True)

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,9 @@ from .analysis import (
 FLOOR_GRID = (0.5000000001, 0.525, 0.55, 0.575, 0.60)
 
 _SCHEMA = "reviewer_revision.floor_robustness.v1"
+_LOCKED_EXPECTED_PAIRS = 300
+_LOCKED_EXPECTED_CELLS = 60
+_LOCKED_EXPECTED_BLOCKS = 12
 _PAIR_COLUMNS = ("model_key", "task", "layer", "pair_seed")
 _CELL_COLUMNS = ("model_key", "task", "layer")
 _BLOCK_COLUMNS = ("model_key", "task")
@@ -146,31 +149,129 @@ def _source_provenance(
                 digest.update(chunk)
         return {
             "input_kind": "path",
-            "source_path": str(path),
+            "source_name": path.name,
             "source_sha256": digest.hexdigest(),
         }
     return {
         "input_kind": ("dataframe" if isinstance(source, pd.DataFrame) else "iterable"),
-        "source_path": None,
+        "source_name": None,
         "source_sha256": None,
     }
 
 
-def _nonblank(value: Any) -> bool:
-    return not pd.isna(value) and bool(str(value).strip())
+def _nonblank_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
-def _finite_nonblank_key(value: Any) -> bool:
-    if not _nonblank(value):
-        return False
-    if isinstance(value, (int, float, np.number)):
-        return bool(np.isfinite(value))
-    return True
+def _integer_scalar(value: Any) -> bool:
+    return isinstance(value, (int, np.integer)) and not isinstance(
+        value, (bool, np.bool_)
+    )
+
+
+def _validated_expected_count(value: Any, name: str) -> int:
+    if not _integer_scalar(value) or value <= 0:
+        raise AnalysisValidationError(f"{name} must be a positive non-boolean integer")
+    return int(value)
+
+
+def _strict_expected_key(item: Any) -> tuple[Any, ...]:
+    if isinstance(item, Mapping):
+        missing = [column for column in _KEY_COLUMNS if column not in item]
+        if missing:
+            raise AnalysisValidationError(
+                f"expected AlterRep key mapping is missing columns: {missing!r}"
+            )
+        key = tuple(item[column] for column in _KEY_COLUMNS)
+    else:
+        try:
+            key = tuple(item)
+        except TypeError as exc:
+            raise AnalysisValidationError(
+                f"expected AlterRep key {item!r} is not iterable"
+            ) from exc
+        if len(key) != len(_KEY_COLUMNS):
+            raise AnalysisValidationError(
+                f"expected AlterRep key {item!r} has {len(key)} fields; "
+                f"expected {len(_KEY_COLUMNS)}"
+            )
+    for column, index in (
+        ("model_key", 0),
+        ("task", 1),
+        ("method", 4),
+        ("condition", 5),
+    ):
+        if not _nonblank_string(key[index]):
+            raise AnalysisValidationError(
+                f"expected AlterRep key {column!r} must be a nonblank string"
+            )
+    if not _integer_scalar(key[2]) or key[2] <= 0:
+        raise AnalysisValidationError(
+            "expected AlterRep key 'layer' must be a positive non-boolean integer"
+        )
+    if not _integer_scalar(key[3]) or key[3] < 0:
+        raise AnalysisValidationError(
+            "expected AlterRep key 'pair_seed' must be a nonnegative "
+            "non-boolean integer"
+        )
+    if key[4] != "alterrep":
+        raise AnalysisValidationError(
+            "expected_alterrep_keys may contain only method 'alterrep'"
+        )
+    if key[5] not in _CONDITIONS:
+        raise AnalysisValidationError(
+            "expected_alterrep_keys conditions must be exactly matched or split"
+        )
+    return key
+
+
+def _validate_expected_universe_structure(
+    expected_keys: Sequence[tuple[Any, ...]],
+    *,
+    expected_pairs: int,
+    expected_cells: int,
+    expected_blocks: int,
+) -> None:
+    planned = pd.DataFrame(expected_keys, columns=_KEY_COLUMNS)
+    for raw_pair, group in planned.groupby(
+        list(_PAIR_COLUMNS), sort=True, dropna=False
+    ):
+        conditions = tuple(sorted(group["condition"].tolist()))
+        if len(group) != 2 or conditions != _CONDITIONS:
+            raise AnalysisValidationError(
+                "expected_alterrep_keys requires exactly matched and split for "
+                f"planned pair {raw_pair!r}; observed {conditions!r}"
+            )
+    counts = {
+        "pairs": len(planned[list(_PAIR_COLUMNS)].drop_duplicates()),
+        "cells": len(planned[list(_CELL_COLUMNS)].drop_duplicates()),
+        "model-task blocks": len(planned[list(_BLOCK_COLUMNS)].drop_duplicates()),
+    }
+    expected = {
+        "pairs": expected_pairs,
+        "cells": expected_cells,
+        "model-task blocks": expected_blocks,
+    }
+    for unit, expected_count in expected.items():
+        if counts[unit] != expected_count:
+            raise AnalysisValidationError(
+                "external expected AlterRep key universe conflicts with expected "
+                f"counts: expected {expected_count} {unit}, universe defines "
+                f"{counts[unit]}"
+            )
 
 
 def _canonical_alterrep_rows(
     source: pd.DataFrame | Path | str | Iterable[Mapping[str, Any]],
+    *,
+    expected_alterrep_keys: Iterable[Any] | None,
+    expected_pairs: int,
+    expected_cells: int,
+    expected_blocks: int,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
+    expected_pairs = _validated_expected_count(expected_pairs, "expected_pairs")
+    expected_cells = _validated_expected_count(expected_cells, "expected_cells")
+    expected_blocks = _validated_expected_count(expected_blocks, "expected_blocks")
     raw = load_rows(source)
     aliases = {
         canonical: _resolved_column(raw, canonical) for canonical in _COLUMN_CANDIDATES
@@ -178,21 +279,30 @@ def _canonical_alterrep_rows(
     canonical = pd.DataFrame(
         {name: raw[source_name] for name, source_name in aliases.items()}
     )
+    invalid_methods = ~canonical["method"].map(_nonblank_string)
+    if invalid_methods.any():
+        raise AnalysisValidationError(
+            "'method' must contain actual nonblank strings; invalid rows "
+            f"{canonical.index[invalid_methods].tolist()[:10]}"
+        )
     selected = canonical.loc[canonical["method"] == "alterrep"].copy()
     if selected.empty:
         raise AnalysisValidationError("no rows found for method 'alterrep'")
 
-    for column in ("model_key", "task", "method", "condition", "status"):
-        validator = (
-            _finite_nonblank_key if column in ("model_key", "task") else _nonblank
-        )
-        invalid = ~selected[column].map(validator)
+    for column in (
+        "model_key",
+        "task",
+        "method",
+        "condition",
+        "status",
+        "edit_hash",
+    ):
+        invalid = ~selected[column].map(_nonblank_string)
         if invalid.any():
             raise AnalysisValidationError(
-                f"{column!r} contains null or blank keys at rows "
+                f"{column!r} must contain actual nonblank strings; invalid rows "
                 f"{selected.index[invalid].tolist()[:10]}"
             )
-        selected[column] = selected[column].map(str)
 
     invalid_conditions = ~selected["condition"].isin(_CONDITIONS)
     if invalid_conditions.any():
@@ -221,21 +331,22 @@ def _canonical_alterrep_rows(
             f"alterrep rows contain unsupported status values: {observed!r}"
         )
 
-    for column in ("layer", "pair_seed"):
-        numeric = pd.to_numeric(selected[column], errors="coerce").astype(float)
-        finite = np.isfinite(numeric.to_numpy(dtype=float))
-        if not finite.all():
-            bad = selected.index[~finite].tolist()
-            raise AnalysisValidationError(
-                f"non-finite values in {column!r} at rows {bad[:10]}"
-            )
-        nonintegral = numeric != np.floor(numeric)
-        if nonintegral.any():
-            bad = selected.index[nonintegral].tolist()
-            raise AnalysisValidationError(
-                f"{column!r} keys must be integer-valued at rows {bad[:10]}"
-            )
-        selected[column] = numeric.astype(int)
+    valid_layers = selected["layer"].map(
+        lambda value: _integer_scalar(value) and value > 0
+    )
+    if not valid_layers.all():
+        raise AnalysisValidationError(
+            "'layer' must contain positive non-boolean integer values; invalid rows "
+            f"{selected.index[~valid_layers].tolist()[:10]}"
+        )
+    valid_pair_seeds = selected["pair_seed"].map(
+        lambda value: _integer_scalar(value) and value >= 0
+    )
+    if not valid_pair_seeds.all():
+        raise AnalysisValidationError(
+            "'pair_seed' must contain nonnegative non-boolean integer values; "
+            f"invalid rows {selected.index[~valid_pair_seeds].tolist()[:10]}"
+        )
 
     selected["target_acc_pre"] = _numeric_measure(selected, "target_acc_pre")
     selected["target_acc_post"] = _numeric_measure(selected, "target_acc_post")
@@ -247,13 +358,6 @@ def _canonical_alterrep_rows(
             f"invalid rows {bad[:10]}"
         )
 
-    invalid_hash = ~selected["edit_hash"].map(_nonblank)
-    if invalid_hash.any():
-        raise AnalysisValidationError(
-            "edit_hash contains null or blank values at rows "
-            f"{selected.index[invalid_hash].tolist()[:10]}"
-        )
-    selected["edit_hash"] = selected["edit_hash"].map(str)
     selected = selected.sort_values(
         [*_PAIR_COLUMNS, "condition"], kind="mergesort"
     ).reset_index(drop=True)
@@ -263,7 +367,6 @@ def _canonical_alterrep_rows(
         raise AnalysisValidationError(
             "alterrep rows contain duplicate pair-condition keys"
         )
-    expected_keys: list[tuple[Any, ...]] = []
     for raw_pair, group in selected.groupby(
         list(_PAIR_COLUMNS), sort=True, dropna=False
     ):
@@ -274,17 +377,46 @@ def _canonical_alterrep_rows(
                 "every alterrep pair requires exactly matched and split rows; "
                 f"invalid pair {pair!r} has conditions {conditions!r}"
             )
-        expected_keys.extend(
-            (*pair, "alterrep", condition) for condition in _CONDITIONS
+
+    completeness = None
+    normalized_expected_keys: tuple[tuple[Any, ...], ...] | None = None
+    if expected_alterrep_keys is not None:
+        normalized_expected_keys = tuple(
+            _strict_expected_key(item) for item in expected_alterrep_keys
+        )
+        if not normalized_expected_keys:
+            raise AnalysisValidationError("expected_alterrep_keys must not be empty")
+        completeness = validate_expected_keys(
+            selected,
+            normalized_expected_keys,
+            _KEY_COLUMNS,
+            success_statuses=tuple(sorted(_ANALYZABLE_STATUSES)),
+            failure_statuses=(),
+        )
+        _validate_expected_universe_structure(
+            normalized_expected_keys,
+            expected_pairs=expected_pairs,
+            expected_cells=expected_cells,
+            expected_blocks=expected_blocks,
         )
 
-    completeness = validate_expected_keys(
-        selected,
-        expected_keys,
-        _KEY_COLUMNS,
-        success_statuses=tuple(sorted(_ANALYZABLE_STATUSES)),
-        failure_statuses=(),
-    )
+    observed_counts = {
+        "pairs": len(selected[list(_PAIR_COLUMNS)].drop_duplicates()),
+        "cells": len(selected[list(_CELL_COLUMNS)].drop_duplicates()),
+        "model-task blocks": len(selected[list(_BLOCK_COLUMNS)].drop_duplicates()),
+    }
+    required_counts = {
+        "pairs": expected_pairs,
+        "cells": expected_cells,
+        "model-task blocks": expected_blocks,
+    }
+    for unit, expected_count in required_counts.items():
+        if observed_counts[unit] != expected_count:
+            raise AnalysisValidationError(
+                "alterrep planned-count mismatch: expected "
+                f"{expected_count} {unit}, observed {observed_counts[unit]}"
+            )
+
     validated_pairs = validate_paired_edit_hashes(
         selected,
         identity_columns=_PAIR_COLUMNS,
@@ -295,6 +427,15 @@ def _canonical_alterrep_rows(
         status: int(count)
         for status, count in selected["status"].value_counts().sort_index().items()
     }
+    locked_counts = (
+        expected_pairs,
+        expected_cells,
+        expected_blocks,
+    ) == (
+        _LOCKED_EXPECTED_PAIRS,
+        _LOCKED_EXPECTED_CELLS,
+        _LOCKED_EXPECTED_BLOCKS,
+    )
     validation = {
         "input_rows": len(raw),
         "selected_rows": len(selected),
@@ -305,9 +446,33 @@ def _canonical_alterrep_rows(
         "score_null_rows": int(selected["status"].isin(_SCORE_NULL_STATUSES).sum()),
         "hard_failure_rows": 0,
         "validated_paired_edit_hashes": int(validated_pairs),
-        "expected_key_count": int(completeness.expected_count),
-        "observed_key_count": int(completeness.observed_count),
-        "keys_complete": bool(completeness.is_complete),
+        "completeness_mode": (
+            "external_key_universe"
+            if completeness is not None
+            else "expected_counts_only"
+        ),
+        "external_key_universe_checked": completeness is not None,
+        "observed_derived_key_universe": False,
+        "expected_count_source": (
+            "locked_defaults" if locked_counts else "explicit_overrides"
+        ),
+        "expected_counts": {
+            "pairs": expected_pairs,
+            "cells": expected_cells,
+            "model_task_blocks": expected_blocks,
+        },
+        "observed_counts": {
+            "pairs": observed_counts["pairs"],
+            "cells": observed_counts["cells"],
+            "model_task_blocks": observed_counts["model-task blocks"],
+        },
+        "expected_key_count": (
+            completeness.expected_count if completeness is not None else None
+        ),
+        "observed_key_count": len(selected),
+        "keys_complete": (
+            bool(completeness.is_complete) if completeness is not None else None
+        ),
         "column_aliases": aliases,
     }
     return selected, validation
@@ -455,42 +620,24 @@ def _coverage_at_floor(alterrep: pd.DataFrame, paired: pd.DataFrame) -> dict[str
     }
 
 
-def _not_estimable_sign_flip() -> dict[str, Any]:
-    return {
-        "status": "not_estimable",
-        "method": "two_sided_exact_paired_sign_flip",
-        "reason": "no model-task block has an analyzed pair at this floor",
-        "n_blocks": 0,
-        "nonzero_count": 0,
-        "zero_count": 0,
-        "p_value": None,
-    }
-
-
-def _floor_summary(alterrep: pd.DataFrame, floor: float) -> dict[str, Any]:
+def _floor_summary(
+    alterrep: pd.DataFrame, floor: float, *, expected_blocks: int
+) -> dict[str, Any]:
     paired, excluded = _floor_pair_data(alterrep, floor)
     coverage = _coverage_at_floor(alterrep, paired)
     requested_pairs = int(alterrep[list(_PAIR_COLUMNS)].drop_duplicates().shape[0])
     requested_blocks = int(alterrep[list(_BLOCK_COLUMNS)].drop_duplicates().shape[0])
     if paired.empty:
-        blocks = pd.DataFrame(columns=[*_BLOCK_COLUMNS, "matched", "split", "gap"])
-        means: dict[str, Any] = {
-            "matched_mean": None,
-            "split_mean": None,
-            "gap": None,
-            "pairs": 0,
-            "cells": 0,
-            "model_task_blocks": 0,
-        }
-        sign_flip = _not_estimable_sign_flip()
-        block_signs = {"positive": 0, "zero": 0, "negative": 0}
-    else:
-        _cells, blocks, means = _hierarchical_means(paired)
-        sign_flip = exact_paired_sign_flip(
-            blocks["gap"].to_numpy(), expected_blocks=len(blocks)
+        raise AnalysisValidationError(
+            f"floor {floor!r} expected {expected_blocks} model-task blocks, "
+            "observed none"
         )
-        sign_flip["status"] = "ok"
-        block_signs = _sign_counts(blocks["gap"])
+    _cells, blocks, means = _hierarchical_means(paired)
+    sign_flip = exact_paired_sign_flip(
+        blocks["gap"].to_numpy(), expected_blocks=expected_blocks
+    )
+    sign_flip["status"] = "ok"
+    block_signs = _sign_counts(blocks["gap"])
     equal_block = {
         "matched": means["matched_mean"],
         "split": means["split_mean"],
@@ -607,13 +754,29 @@ def _partial_identification(
 def summarize_floor_robustness(
     rows: pd.DataFrame | Path | str | Iterable[Mapping[str, Any]],
     *,
+    expected_alterrep_keys: Iterable[Any] | None = None,
+    expected_pairs: int = _LOCKED_EXPECTED_PAIRS,
+    expected_cells: int = _LOCKED_EXPECTED_CELLS,
+    expected_blocks: int = _LOCKED_EXPECTED_BLOCKS,
     draws: int = 10_000,
     seed: int = 20260830,
 ) -> dict[str, Any]:
-    """Return deterministic post-hoc raw-drop and floor-robustness analyses."""
+    """Return deterministic post-hoc raw-drop and floor-robustness analyses.
+
+    ``expected_alterrep_keys`` is the caller's exact planned six-field row-key
+    universe.  When it is omitted, the summary enforces the locked 300-pair,
+    60-cell, 12-block counts but reports that only count completeness was
+    checked.  Explicit count overrides support deliberately small fixtures.
+    """
 
     provenance = _source_provenance(rows)
-    alterrep, validation = _canonical_alterrep_rows(rows)
+    alterrep, validation = _canonical_alterrep_rows(
+        rows,
+        expected_alterrep_keys=expected_alterrep_keys,
+        expected_pairs=expected_pairs,
+        expected_cells=expected_cells,
+        expected_blocks=expected_blocks,
+    )
     alterrep["raw_drop"] = raw_target_drop(alterrep)
     raw_pairs = _paired_values(alterrep, "raw_drop")
     raw_cells, raw_blocks, raw_means = _hierarchical_means(raw_pairs)
@@ -629,7 +792,7 @@ def summarize_floor_robustness(
     )
     bootstrap["equal_block_point_estimate"] = raw_means["gap"]
     raw_sign_flip = exact_paired_sign_flip(
-        raw_blocks["gap"].to_numpy(), expected_blocks=len(raw_blocks)
+        raw_blocks["gap"].to_numpy(), expected_blocks=expected_blocks
     )
     raw_sign_flip["status"] = "ok"
     raw_summary = {
@@ -649,7 +812,10 @@ def summarize_floor_robustness(
         "exact_sign_flip": raw_sign_flip,
         "block_gap_sign_counts": _sign_counts(raw_blocks["gap"]),
     }
-    floor_curve = [_floor_summary(alterrep, floor) for floor in FLOOR_GRID]
+    floor_curve = [
+        _floor_summary(alterrep, floor, expected_blocks=expected_blocks)
+        for floor in FLOOR_GRID
+    ]
     locked_floor = next(row for row in floor_curve if row["floor"] == 0.55)
     partial = _partial_identification(alterrep, locked_floor["gap"])
     units = {
