@@ -19,7 +19,6 @@ import pandas as pd
 from .analysis import (
     AnalysisValidationError,
     exact_paired_sign_flip,
-    hierarchical_bootstrap,
     load_rows,
     validate_expected_keys,
     validate_paired_edit_hashes,
@@ -62,14 +61,52 @@ _COLUMN_CANDIDATES: dict[str, tuple[str, ...]] = {
 }
 
 
+def _require_unique_column_labels(frame: pd.DataFrame) -> None:
+    duplicates = frame.columns[frame.columns.duplicated(keep=False)].tolist()
+    if duplicates:
+        ordered = list(dict.fromkeys(duplicates))
+        raise AnalysisValidationError(
+            f"row artifact contains duplicate column labels: {ordered!r}"
+        )
+
+
+def _alias_values_equivalent(left: pd.Series, right: pd.Series) -> bool:
+    left_missing = left.isna()
+    right_missing = right.isna()
+    if not left_missing.equals(right_missing):
+        return False
+    populated = ~left_missing
+    if not populated.any():
+        return True
+    try:
+        left_values = left.loc[populated].astype(object).reset_index(drop=True)
+        right_values = right.loc[populated].astype(object).reset_index(drop=True)
+    except (TypeError, ValueError):
+        return False
+    return left_values.equals(right_values)
+
+
 def _resolved_column(frame: pd.DataFrame, canonical: str) -> str:
-    for candidate in _COLUMN_CANDIDATES[canonical]:
-        if candidate in frame.columns:
-            return candidate
-    raise AnalysisValidationError(
-        f"row artifact is missing required column {canonical!r}; "
-        f"accepted names are {list(_COLUMN_CANDIDATES[canonical])!r}"
-    )
+    _require_unique_column_labels(frame)
+    present = [
+        candidate
+        for candidate in _COLUMN_CANDIDATES[canonical]
+        if candidate in frame.columns
+    ]
+    if not present:
+        raise AnalysisValidationError(
+            f"row artifact is missing required column {canonical!r}; "
+            f"accepted names are {list(_COLUMN_CANDIDATES[canonical])!r}"
+        )
+    populated = [candidate for candidate in present if frame[candidate].notna().any()]
+    selected = populated[0] if populated else present[0]
+    for alias in populated[1:]:
+        if not _alias_values_equivalent(frame[selected], frame[alias]):
+            raise AnalysisValidationError(
+                f"conflicting populated aliases for {canonical!r}: "
+                f"{selected!r} and {alias!r}"
+            )
+    return selected
 
 
 def _numeric_measure(
@@ -79,6 +116,12 @@ def _numeric_measure(
     require_unit_interval: bool = True,
 ) -> pd.Series:
     source = _resolved_column(frame, canonical)
+    boolean = frame[source].map(lambda value: isinstance(value, (bool, np.bool_)))
+    if boolean.any():
+        bad = frame.index[boolean].tolist()
+        raise AnalysisValidationError(
+            f"{canonical!r} must not contain boolean values; invalid rows {bad[:10]}"
+        )
     values = pd.to_numeric(frame[source], errors="coerce").astype(float)
     finite = np.isfinite(values.to_numpy(dtype=float))
     if not finite.all():
@@ -110,6 +153,8 @@ def target_damage_at_floor(frame: pd.DataFrame, floor: float) -> pd.Series:
     approximate so threshold-boundary behavior is auditable.
     """
 
+    if isinstance(floor, (bool, np.bool_)):
+        raise AnalysisValidationError("floor must be numeric, not boolean")
     try:
         numeric_floor = float(floor)
     except (TypeError, ValueError) as exc:
@@ -175,6 +220,12 @@ def _validated_expected_count(value: Any, name: str) -> int:
     return int(value)
 
 
+def _validated_seed(value: Any) -> int:
+    if not _integer_scalar(value) or value < 0:
+        raise AnalysisValidationError("seed must be a nonnegative non-boolean integer")
+    return int(value)
+
+
 def _strict_expected_key(item: Any) -> tuple[Any, ...]:
     if isinstance(item, Mapping):
         missing = [column for column in _KEY_COLUMNS if column not in item]
@@ -225,13 +276,41 @@ def _strict_expected_key(item: Any) -> tuple[Any, ...]:
     return key
 
 
+def _hierarchy_shape(frame: pd.DataFrame, *, context: str) -> dict[str, Any]:
+    pairs = frame[list(_PAIR_COLUMNS)].drop_duplicates()
+    cells = pairs[list(_CELL_COLUMNS)].drop_duplicates()
+    pairs_per_cell = pairs.groupby(list(_CELL_COLUMNS), sort=True, dropna=False).size()
+    cells_per_block = cells.groupby(
+        list(_BLOCK_COLUMNS), sort=True, dropna=False
+    ).size()
+    if pairs_per_cell.empty or (pairs_per_cell <= 0).any():
+        raise AnalysisValidationError(
+            f"{context} must contain a positive number of pairs per cell"
+        )
+    if cells_per_block.empty or (cells_per_block <= 0).any():
+        raise AnalysisValidationError(
+            f"{context} must contain a positive number of cells per model-task block"
+        )
+    pair_counts = sorted({int(value) for value in pairs_per_cell.tolist()})
+    cell_counts = sorted({int(value) for value in cells_per_block.tolist()})
+    return {
+        "balanced": len(pair_counts) == 1 and len(cell_counts) == 1,
+        "pairs_per_cell": pair_counts[0] if len(pair_counts) == 1 else None,
+        "cells_per_model_task_block": (
+            cell_counts[0] if len(cell_counts) == 1 else None
+        ),
+        "pairs_per_cell_values": pair_counts,
+        "cells_per_model_task_block_values": cell_counts,
+    }
+
+
 def _validate_expected_universe_structure(
     expected_keys: Sequence[tuple[Any, ...]],
     *,
     expected_pairs: int,
     expected_cells: int,
     expected_blocks: int,
-) -> None:
+) -> dict[str, Any]:
     planned = pd.DataFrame(expected_keys, columns=_KEY_COLUMNS)
     for raw_pair, group in planned.groupby(
         list(_PAIR_COLUMNS), sort=True, dropna=False
@@ -259,6 +338,7 @@ def _validate_expected_universe_structure(
                 f"counts: expected {expected_count} {unit}, universe defines "
                 f"{counts[unit]}"
             )
+    return _hierarchy_shape(planned, context="external expected AlterRep key universe")
 
 
 def _canonical_alterrep_rows(
@@ -273,21 +353,23 @@ def _canonical_alterrep_rows(
     expected_cells = _validated_expected_count(expected_cells, "expected_cells")
     expected_blocks = _validated_expected_count(expected_blocks, "expected_blocks")
     raw = load_rows(source)
-    aliases = {
-        canonical: _resolved_column(raw, canonical) for canonical in _COLUMN_CANDIDATES
-    }
-    canonical = pd.DataFrame(
-        {name: raw[source_name] for name, source_name in aliases.items()}
-    )
-    invalid_methods = ~canonical["method"].map(_nonblank_string)
+    method_source = _resolved_column(raw, "method")
+    invalid_methods = ~raw[method_source].map(_nonblank_string)
     if invalid_methods.any():
         raise AnalysisValidationError(
             "'method' must contain actual nonblank strings; invalid rows "
-            f"{canonical.index[invalid_methods].tolist()[:10]}"
+            f"{raw.index[invalid_methods].tolist()[:10]}"
         )
-    selected = canonical.loc[canonical["method"] == "alterrep"].copy()
-    if selected.empty:
+    selected_raw = raw.loc[raw[method_source] == "alterrep"].copy()
+    if selected_raw.empty:
         raise AnalysisValidationError("no rows found for method 'alterrep'")
+    aliases = {
+        canonical: _resolved_column(selected_raw, canonical)
+        for canonical in _COLUMN_CANDIDATES
+    }
+    selected = pd.DataFrame(
+        {name: selected_raw[source_name] for name, source_name in aliases.items()}
+    )
 
     for column in (
         "model_key",
@@ -380,6 +462,7 @@ def _canonical_alterrep_rows(
 
     completeness = None
     normalized_expected_keys: tuple[tuple[Any, ...], ...] | None = None
+    planned_shape: dict[str, Any] | None = None
     if expected_alterrep_keys is not None:
         normalized_expected_keys = tuple(
             _strict_expected_key(item) for item in expected_alterrep_keys
@@ -393,7 +476,7 @@ def _canonical_alterrep_rows(
             success_statuses=tuple(sorted(_ANALYZABLE_STATUSES)),
             failure_statuses=(),
         )
-        _validate_expected_universe_structure(
+        planned_shape = _validate_expected_universe_structure(
             normalized_expected_keys,
             expected_pairs=expected_pairs,
             expected_cells=expected_cells,
@@ -416,6 +499,9 @@ def _canonical_alterrep_rows(
                 "alterrep planned-count mismatch: expected "
                 f"{expected_count} {unit}, observed {observed_counts[unit]}"
             )
+    observed_shape = _hierarchy_shape(
+        selected, context="observed AlterRep row universe"
+    )
 
     validated_pairs = validate_paired_edit_hashes(
         selected,
@@ -465,6 +551,19 @@ def _canonical_alterrep_rows(
             "pairs": observed_counts["pairs"],
             "cells": observed_counts["cells"],
             "model_task_blocks": observed_counts["model-task blocks"],
+        },
+        "balanced_hierarchy_checked": True,
+        "balanced_hierarchy": observed_shape["balanced"],
+        "pairs_per_cell": observed_shape["pairs_per_cell"],
+        "cells_per_model_task_block": observed_shape["cells_per_model_task_block"],
+        "pairs_per_cell_values": observed_shape["pairs_per_cell_values"],
+        "cells_per_model_task_block_values": observed_shape[
+            "cells_per_model_task_block_values"
+        ],
+        "hierarchy_balance": {
+            "required": False,
+            "observed": observed_shape,
+            "external_planned": planned_shape,
         },
         "expected_key_count": (
             completeness.expected_count if completeness is not None else None
@@ -529,6 +628,66 @@ def _hierarchical_means(
         "model_task_blocks": len(blocks),
     }
     return cells, blocks, means
+
+
+def _equal_block_hierarchical_bootstrap(
+    paired: pd.DataFrame,
+    *,
+    draws: int,
+    seed: int,
+    confidence: float = 0.95,
+) -> dict[str, Any]:
+    """Bootstrap pairs, cells, and model-task blocks with equal block weight."""
+
+    ordered = paired.sort_values(list(_PAIR_COLUMNS), kind="mergesort")
+    hierarchy: list[tuple[tuple[Any, ...], list[np.ndarray]]] = []
+    for raw_block, block_frame in ordered.groupby(
+        list(_BLOCK_COLUMNS), sort=True, dropna=False
+    ):
+        block = raw_block if isinstance(raw_block, tuple) else (raw_block,)
+        cells = [
+            cell_frame["gap"].to_numpy(dtype=float)
+            for _, cell_frame in block_frame.groupby("layer", sort=True, dropna=False)
+        ]
+        hierarchy.append((tuple(block), cells))
+
+    original_block_means = [
+        float(np.mean([float(values.mean()) for values in cells]))
+        for _, cells in hierarchy
+    ]
+    rng = np.random.default_rng(seed)
+    replicates = np.empty(draws, dtype=np.float64)
+    n_blocks = len(hierarchy)
+    for draw in range(draws):
+        sampled_block_means: list[float] = []
+        for block_index in rng.integers(0, n_blocks, size=n_blocks):
+            cells = hierarchy[int(block_index)][1]
+            n_cells = len(cells)
+            sampled_cell_means: list[float] = []
+            for cell_index in rng.integers(0, n_cells, size=n_cells):
+                values = cells[int(cell_index)]
+                sampled = values[rng.integers(0, len(values), size=len(values))]
+                sampled_cell_means.append(float(sampled.mean()))
+            sampled_block_means.append(float(np.mean(sampled_cell_means)))
+        replicates[draw] = float(np.mean(sampled_block_means))
+
+    tail = (1.0 - confidence) / 2.0
+    ci_low, ci_high = np.quantile(replicates, (tail, 1.0 - tail))
+    return {
+        "method": "equal_block_hierarchical_percentile_bootstrap",
+        "cluster_unit": "model_key_task",
+        "hierarchy": ["model_task", "layer", "pair"],
+        "estimand_weighting": "equal_model_task_blocks",
+        "draws": int(draws),
+        "seed": int(seed),
+        "confidence": float(confidence),
+        "point_estimate": float(np.mean(original_block_means)),
+        "ci_low": float(ci_low),
+        "ci_high": float(ci_high),
+        "n_blocks": n_blocks,
+        "n_cells": int(sum(len(cells) for _, cells in hierarchy)),
+        "n_pairs": len(paired),
+    }
 
 
 def _sign_counts(values: pd.Series) -> dict[str, int]:
@@ -769,6 +928,8 @@ def summarize_floor_robustness(
     checked.  Explicit count overrides support deliberately small fixtures.
     """
 
+    draws = _validated_expected_count(draws, "draws")
+    seed = _validated_seed(seed)
     provenance = _source_provenance(rows)
     alterrep, validation = _canonical_alterrep_rows(
         rows,
@@ -780,13 +941,8 @@ def summarize_floor_robustness(
     alterrep["raw_drop"] = raw_target_drop(alterrep)
     raw_pairs = _paired_values(alterrep, "raw_drop")
     raw_cells, raw_blocks, raw_means = _hierarchical_means(raw_pairs)
-    bootstrap_frame = raw_pairs.rename(columns={"model_key": "model"})
-    bootstrap = hierarchical_bootstrap(
-        bootstrap_frame,
-        value_column="gap",
-        block_columns=("model", "task"),
-        layer_column="layer",
-        pair_column="pair_seed",
+    bootstrap = _equal_block_hierarchical_bootstrap(
+        raw_pairs,
         draws=draws,
         seed=seed,
     )

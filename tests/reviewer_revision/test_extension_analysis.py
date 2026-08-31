@@ -19,7 +19,17 @@ from src.reviewer_revision.extension_analysis import (
 
 _PLAN_COUNTS = {"expected_pairs": 2, "expected_cells": 2, "expected_blocks": 2}
 _HIERARCHY_COUNTS = {
+    "expected_pairs": 4,
+    "expected_cells": 4,
+    "expected_blocks": 2,
+}
+_UNBALANCED_COUNTS = {
     "expected_pairs": 3,
+    "expected_cells": 3,
+    "expected_blocks": 2,
+}
+_UNEQUAL_PAIR_COUNTS = {
+    "expected_pairs": 4,
     "expected_cells": 3,
     "expected_blocks": 2,
 }
@@ -86,6 +96,7 @@ def _real_hierarchy_fixture_rows() -> list[dict[str, object]]:
         ("model-a", 1, 0.2),
         ("model-a", 2, 0.4),
         ("model-b", 1, 0.8),
+        ("model-b", 2, 0.6),
     ):
         split_drop = 0.1
         matched_drop = split_drop + gap
@@ -97,6 +108,35 @@ def _real_hierarchy_fixture_rows() -> list[dict[str, object]]:
                 pair_seed=0,
                 matched=(0.9, 0.9 - matched_drop),
                 split=(0.9, 0.9 - split_drop),
+            )
+        )
+    return rows
+
+
+def _unbalanced_hierarchy_fixture_rows() -> list[dict[str, object]]:
+    return [
+        row
+        for row in _real_hierarchy_fixture_rows()
+        if not (row["model_key"] == "model-b" and row["layer"] == 2)
+    ]
+
+
+def _unequal_pair_count_fixture_rows() -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for model, layer, pair_seed, gap in (
+        ("model-a", 1, 0, 0.2),
+        ("model-a", 1, 1, 0.4),
+        ("model-a", 2, 0, 0.7),
+        ("model-b", 1, 0, 0.8),
+    ):
+        rows.extend(
+            _pair_rows(
+                model=model,
+                task="shared-task",
+                layer=layer,
+                pair_seed=pair_seed,
+                matched=(0.9, 0.8 - gap),
+                split=(0.9, 0.8),
             )
         )
     return rows
@@ -150,6 +190,20 @@ def test_target_damage_helper_requires_exact_chance() -> None:
         target_damage_at_floor(frame, 0.55)
 
 
+@pytest.mark.parametrize("floor", [True, np.bool_(False)])
+def test_target_damage_helper_rejects_boolean_floors(floor: object) -> None:
+    frame = pd.DataFrame(
+        {
+            "target_acc_pre": [0.8],
+            "target_acc_post": [0.7],
+            "chance": [0.5],
+        }
+    )
+
+    with pytest.raises(AnalysisValidationError, match="floor.*boolean"):
+        target_damage_at_floor(frame, floor)  # type: ignore[arg-type]
+
+
 def test_floor_robustness_includes_every_raw_drop_pair() -> None:
     summary = summarize_floor_robustness(
         pd.DataFrame(_plan_fixture_rows()), draws=200, seed=7, **_PLAN_COUNTS
@@ -169,9 +223,12 @@ def test_floor_robustness_includes_every_raw_drop_pair() -> None:
     assert summary["validation"]["external_key_universe_checked"] is False
     assert summary["validation"]["keys_complete"] is None
     assert summary["validation"]["expected_count_source"] == "explicit_overrides"
+    assert summary["validation"]["balanced_hierarchy_checked"] is True
+    assert summary["validation"]["pairs_per_cell"] == 1
+    assert summary["validation"]["cells_per_model_task_block"] == 1
 
 
-def test_raw_drop_uses_equal_model_task_blocks_not_equal_cells() -> None:
+def test_raw_drop_reports_the_balanced_planned_hierarchy() -> None:
     summary = summarize_floor_robustness(
         _real_hierarchy_fixture_rows(),
         draws=50,
@@ -180,10 +237,60 @@ def test_raw_drop_uses_equal_model_task_blocks_not_equal_cells() -> None:
     )
 
     raw = summary["raw_drop"]
+    assert raw["matched_mean"] == pytest.approx(0.60)
+    assert raw["split_mean"] == pytest.approx(0.10)
+    assert raw["gap"] == pytest.approx(0.50)
+    assert summary["validation"]["pairs_per_cell"] == 1
+    assert summary["validation"]["cells_per_model_task_block"] == 2
+
+
+@pytest.mark.parametrize("with_external_universe", [False, True])
+def test_equal_block_bootstrap_supports_unequal_cells_per_block(
+    with_external_universe: bool,
+) -> None:
+    rows = _unbalanced_hierarchy_fixture_rows()
+    completeness = (
+        {"expected_alterrep_keys": _alterrep_keys(rows)}
+        if with_external_universe
+        else {}
+    )
+
+    summary = summarize_floor_robustness(
+        rows,
+        draws=50,
+        seed=17,
+        **completeness,
+        **_UNBALANCED_COUNTS,
+    )
+
+    raw = summary["raw_drop"]
     assert raw["matched_mean"] == pytest.approx(0.65)
     assert raw["split_mean"] == pytest.approx(0.10)
     assert raw["gap"] == pytest.approx(0.55)
-    assert raw["gap"] != pytest.approx((0.2 + 0.4 + 0.8) / 3.0)
+    assert raw["bootstrap"]["point_estimate"] == pytest.approx(0.55)
+    assert summary["validation"]["balanced_hierarchy"] is False
+    assert summary["validation"]["pairs_per_cell_values"] == [1]
+    assert summary["validation"]["cells_per_model_task_block_values"] == [1, 2]
+
+
+def test_equal_block_bootstrap_supports_unequal_pairs_per_cell() -> None:
+    rows = _unequal_pair_count_fixture_rows()
+
+    summary = summarize_floor_robustness(
+        rows,
+        expected_alterrep_keys=_alterrep_keys(rows),
+        draws=50,
+        seed=23,
+        **_UNEQUAL_PAIR_COUNTS,
+    )
+
+    raw = summary["raw_drop"]
+    assert raw["gap"] == pytest.approx(0.65)
+    assert raw["bootstrap"]["point_estimate"] == pytest.approx(0.65)
+    assert raw["bootstrap"]["n_pairs"] == 4
+    assert summary["validation"]["balanced_hierarchy"] is False
+    assert summary["validation"]["pairs_per_cell_values"] == [1, 2]
+    assert summary["validation"]["cells_per_model_task_block_values"] == [1, 2]
 
 
 def test_locked_default_counts_reject_a_small_observed_derived_universe() -> None:
@@ -229,13 +336,13 @@ def test_expected_counts_reject_a_deleted_whole_cell() -> None:
         row for row in rows if not (row["model_key"] == "model-a" and row["layer"] == 2)
     ]
 
-    with pytest.raises(AnalysisValidationError, match="expected 3 cells"):
+    with pytest.raises(AnalysisValidationError, match="expected 4 cells"):
         summarize_floor_robustness(
             observed,
             draws=10,
             seed=1,
-            expected_pairs=2,
-            expected_cells=3,
+            expected_pairs=3,
+            expected_cells=4,
             expected_blocks=2,
         )
 
@@ -583,6 +690,160 @@ def test_model_task_and_measurement_aliases_are_accepted() -> None:
     assert summary["raw_drop"]["pairs"] == 2
     assert summary["validation"]["column_aliases"]["model_key"] == "model"
     assert summary["validation"]["column_aliases"]["task"] == "task_key"
+
+
+def test_duplicate_dataframe_column_labels_are_rejected() -> None:
+    frame = pd.DataFrame(_plan_fixture_rows())
+    duplicate = pd.concat([frame, frame[["model_key"]]], axis=1)
+
+    with pytest.raises(AnalysisValidationError, match="duplicate column labels"):
+        summarize_floor_robustness(duplicate, draws=20, seed=5, **_PLAN_COUNTS)
+
+
+@pytest.mark.parametrize(
+    "canonical, alias, replacement",
+    [
+        ("model_key", "model", "different-model"),
+        ("condition", "scoring_condition", "different-condition"),
+        ("target_acc_pre", "target_accuracy_pre", 0.51),
+    ],
+)
+def test_conflicting_populated_aliases_are_rejected(
+    canonical: str, alias: str, replacement: object
+) -> None:
+    frame = pd.DataFrame(_plan_fixture_rows())
+    frame[alias] = frame[canonical]
+    frame.loc[0, alias] = replacement
+
+    with pytest.raises(
+        AnalysisValidationError, match=rf"conflicting populated aliases.*{canonical}"
+    ):
+        summarize_floor_robustness(frame, draws=20, seed=5, **_PLAN_COUNTS)
+
+
+def test_identical_redundant_aliases_and_null_legacy_fallbacks_are_accepted() -> None:
+    frame = pd.DataFrame(_plan_fixture_rows())
+    frame["model"] = frame["model_key"]
+    frame["scoring_condition"] = frame["condition"]
+    frame["target_accuracy_pre"] = frame["target_acc_pre"]
+    frame["target_accuracy_post"] = frame["target_acc_post"]
+    frame["raw_target_accuracy_pre"] = np.nan
+    frame["raw_target_accuracy_post"] = np.nan
+
+    summary = summarize_floor_robustness(frame, draws=20, seed=5, **_PLAN_COUNTS)
+
+    aliases = summary["validation"]["column_aliases"]
+    assert aliases["model_key"] == "model_key"
+    assert aliases["condition"] == "condition"
+    assert aliases["target_acc_pre"] == "target_acc_pre"
+    assert aliases["target_acc_post"] == "target_acc_post"
+
+
+def test_identical_categorical_alias_values_ignore_category_metadata() -> None:
+    frame = pd.DataFrame(_plan_fixture_rows())
+    model_values = frame["model_key"].tolist()
+    frame["model_key"] = pd.Categorical(
+        model_values, categories=["bert", "gpt2", "unused-model-a"]
+    )
+    frame["model"] = pd.Categorical(
+        model_values, categories=["bert", "gpt2", "unused-model-b"]
+    )
+    values = frame["target_acc_pre"].tolist()
+    frame["target_acc_pre"] = pd.Categorical(values, categories=sorted({*values, 0.51}))
+    frame["target_accuracy_pre"] = pd.Categorical(
+        values, categories=sorted({*values, 0.52})
+    )
+
+    summary = summarize_floor_robustness(frame, draws=20, seed=5, **_PLAN_COUNTS)
+
+    assert summary["raw_drop"]["pairs"] == 2
+    assert summary["validation"]["column_aliases"]["model_key"] == "model_key"
+    assert summary["validation"]["column_aliases"]["target_acc_pre"] == (
+        "target_acc_pre"
+    )
+
+
+def test_alias_equivalence_is_checked_within_the_selected_alterrep_rows() -> None:
+    alterrep = pd.DataFrame(_plan_fixture_rows())
+    other_method = alterrep.copy()
+    other_method["method"] = "fgsm"
+    frame = pd.concat([alterrep, other_method], ignore_index=True)
+    frame["raw_target_accuracy_pre"] = np.nan
+    frame["raw_target_accuracy_post"] = np.nan
+    other = frame["method"] == "fgsm"
+    frame.loc[other, "raw_target_accuracy_pre"] = 0.75
+    frame.loc[other, "raw_target_accuracy_post"] = 0.50
+
+    summary = summarize_floor_robustness(frame, draws=20, seed=5, **_PLAN_COUNTS)
+
+    assert summary["validation"]["input_rows"] == 8
+    assert summary["validation"]["selected_rows"] == 4
+    assert summary["validation"]["column_aliases"]["target_acc_pre"] == (
+        "target_acc_pre"
+    )
+
+
+def test_first_populated_measurement_alias_is_selected_over_a_null_preferred_column() -> (
+    None
+):
+    frame = pd.DataFrame(_plan_fixture_rows())
+    frame["target_accuracy_pre"] = frame["target_acc_pre"]
+    frame["target_acc_pre"] = np.nan
+
+    summary = summarize_floor_robustness(frame, draws=20, seed=5, **_PLAN_COUNTS)
+
+    assert (
+        summary["validation"]["column_aliases"]["target_acc_pre"]
+        == "target_accuracy_pre"
+    )
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("target_acc_pre", True),
+        ("target_acc_pre", np.bool_(False)),
+        ("target_acc_post", True),
+        ("target_acc_post", np.bool_(False)),
+        ("chance", True),
+        ("chance", np.bool_(False)),
+    ],
+)
+def test_measurements_reject_python_and_numpy_booleans(
+    field: str, value: object
+) -> None:
+    frame = pd.DataFrame(_plan_fixture_rows())
+    frame[field] = value
+
+    with pytest.raises(AnalysisValidationError, match=rf"{field!r}.*boolean"):
+        summarize_floor_robustness(frame, draws=20, seed=5, **_PLAN_COUNTS)
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"draws": True}, "draws.*positive non-boolean integer"),
+        ({"draws": np.bool_(True)}, "draws.*positive non-boolean integer"),
+        ({"draws": 1.0}, "draws.*positive non-boolean integer"),
+        ({"draws": 0}, "draws.*positive non-boolean integer"),
+        ({"draws": -1}, "draws.*positive non-boolean integer"),
+        ({"seed": True}, "seed.*nonnegative non-boolean integer"),
+        ({"seed": np.bool_(False)}, "seed.*nonnegative non-boolean integer"),
+        ({"seed": 1.0}, "seed.*nonnegative non-boolean integer"),
+        ({"seed": -1}, "seed.*nonnegative non-boolean integer"),
+    ],
+)
+def test_draws_and_seed_require_domain_valid_non_boolean_integers(
+    overrides: dict[str, object], message: str
+) -> None:
+    arguments: dict[str, object] = {"draws": 20, "seed": 5, **overrides}
+
+    with pytest.raises(AnalysisValidationError, match=message):
+        summarize_floor_robustness(
+            _plan_fixture_rows(),
+            **arguments,
+            **_PLAN_COUNTS,  # type: ignore[arg-type]
+        )
 
 
 def test_summary_is_shuffle_rng_deterministic_and_json_serializable() -> None:
