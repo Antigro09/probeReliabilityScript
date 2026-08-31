@@ -1,0 +1,83 @@
+schema_version: 1
+run_name: reviewer_caveat_extension_2026_08
+purpose: >-
+  Prospectively evaluate fresh-decoder recovery in the 11 untouched
+  middle-layer model-task cells while retaining the inspected Qwen/SST-2
+  layer-14 result as a disclosed pilot only.
+
+base_run: results/reviewer_revision_2026_08/20260830T024520Z-7aab3eb
+
+construct_panel:
+  # This inspected cell is descriptive pilot evidence, never confirmatory.
+  pilot:
+    model_key: qwen
+    model_id: Qwen/Qwen2.5-1.5B
+    task: sst2
+    layer: 14
+  # Base-spec model order, then base-spec task order, with the pilot omitted.
+  confirmatory_cells:
+    - model_key: pythia
+      model_id: EleutherAI/pythia-160m
+      task: sva
+      layer: 6
+    - model_key: pythia
+      model_id: EleutherAI/pythia-160m
+      task: sst2
+      layer: 6
+    - model_key: gpt2
+      model_id: openai-community/gpt2
+      task: sva
+      layer: 6
+    - model_key: gpt2
+      model_id: openai-community/gpt2
+      task: sst2
+      layer: 6
+    - model_key: bert
+      model_id: google-bert/bert-base-uncased
+      task: sva
+      layer: 6
+    - model_key: bert
+      model_id: google-bert/bert-base-uncased
+      task: sst2
+      layer: 6
+    - model_key: qwen
+      model_id: Qwen/Qwen2.5-1.5B
+      task: sva
+      layer: 14
+    - model_key: gemma
+      model_id: google/gemma-2-2b
+      task: sva
+      layer: 14
+    - model_key: gemma
+      model_id: google/gemma-2-2b
+      task: sst2
+      layer: 14
+    - model_key: llama
+      model_id: meta-llama/Llama-3.2-3B
+      task: sva
+      layer: 14
+    - model_key: llama
+      model_id: meta-llama/Llama-3.2-3B
+      task: sst2
+      layer: 14
+  recovery_thresholds:
+    accuracy: 0.55
+    target_recovery_ratio: 0.50
+    control_retention_ratio: 0.80
+
+inference:
+  bootstrap:
+    draws: 10000
+    seed: 20260830
+    resampling_unit: final_test_group_id
+    shared_resamples_across_models_within_task: true
+  alternative: one_sided
+  multiplicity: holm
+  family_size: 11
+
+storage:
+  disk_reserve_gib: 8.0
+
+outputs:
+  root: results/reviewer_caveat_extension_2026_08
+  immutable_run_directory: true
