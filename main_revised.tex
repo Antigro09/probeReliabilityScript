@@ -59,6 +59,7 @@
 \author{Anonymous Authors}
 
 \begin{document}
+\input{extension_numbers.tex}
 
 \maketitle
 
@@ -104,7 +105,14 @@ Across 59 analyzable, equally weighted model--layer--task cells from 60 requeste
 
 % BEGIN POST-RUN FLOOR-SENSITIVITY UPDATE
 \paragraph{Denominator-floor robustness.}
-The registered available-case estimand remains primary. A separately labeled post-hoc analysis reports the full-case raw accuracy-drop contrast, every prespecified denominator floor, and a deterministic partial-identification bound at the locked floor.
+As a post-hoc full-case sensitivity, the raw target-accuracy-drop contrast uses all 300 paired edits: matched and split mean drops are \FloorRawMatched{} and \FloorRawSplit{}, for an equal-block gap of \FloorRawGap{} (95\% hierarchical interval \FloorRawCI{}; exact block sign-flip $p=\FloorRawP$). This check has no unstable chance-normalized denominator and does not replace the registered normalized-damage primary analysis. Across the complete prespecified floor curve, the locked $0.55$ floor retains \FloorLockedPairs{} pairs and gives gap \FloorLockedGap{}. Bounding each missing paired normalized-damage gap in $[-1,1]$ yields the deterministic partial-identification bound \FloorPartialBound{}; it is not a confidence interval.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.78\linewidth]{figures/fig_floor_sensitivity.pdf}
+  \caption{Post-hoc denominator-floor sensitivity. Panel A shows the equal-block matched-minus-split contrast over every prespecified floor, the full-case raw-drop contrast, and the locked-floor deterministic partial-identification bound. Panel B shows analyzed-pair coverage. The registered available-case analysis remains primary.}
+  \label{fig:floor-sensitivity}
+\end{figure}
 % END POST-RUN FLOOR-SENSITIVITY UPDATE
 
 % BEGIN POST-RUN EPSILON-SWEEP UPDATE
@@ -171,14 +179,19 @@ Across 5,400 records, 48.9\% equal $1.0$ and the median is $0.9999$; replacing t
 Table~\ref{tab:protocol} turns the observed failure modes into checks that can reject a ranking target before any correlation analysis. Passing every row removes the channels listed here; it does not prove that an edit captures the intended construct.
 
 % BEGIN POST-RUN CONSTRUCT-CONTEXT UPDATE
-We ran the candidate-identity, evaluator-separation, saturation, data-overlap, and dependence-aware inference checks. The registered archive lacked per-example artifacts for retrospective orientation and fresh-decoder tests; a disclosed pilot and a separately registered prospective panel provide those follow-up checks without changing the original analysis.
+We ran the candidate-identity, evaluator-separation, saturation, data-overlap, and dependence-aware inference checks. The registered archive lacked the per-example artifacts required for retrospective orientation and fresh-decoder tests. A disclosed descriptive pilot and the separately registered 11-cell prospective panel provide those follow-up checks without changing the original analysis.
 % END POST-RUN CONSTRUCT-CONTEXT UPDATE
 
 % BEGIN POST-RUN CONSTRUCT-PANEL UPDATE
-% BEGIN POST-RUN ORIENTATION-REDECODABILITY UPDATE
-\paragraph{Construct follow-up.}
-The disclosed pilot compatibility endpoints remain in Appendix~\ref{app:pilot-compatibility}; the prospective panel replaces this placeholder after its exact-key validation gate passes.
-% END POST-RUN ORIENTATION-REDECODABILITY UPDATE
+\paragraph{Prospective construct panel.}
+The inspected Qwen/SST-2/layer-14 result remains a disclosed descriptive pilot. We prospectively evaluated the same fresh-linear recovery endpoints in 11 untouched middle-layer cells using shared task-group resamples across models. Of those cells, \ConstructPointPassingCells{} pass all three locked point thresholds, \ConstructHolmPassingCells{} pass the one-sided Holm-adjusted cell rule, and \ConstructPassingCells{} pass both; \ConstructNonestimableCells{} are nonestimable and remain in the fixed 11-cell family with internal $p=1$. The displayed one-sided 95\% lower bounds are marginal, neither multiplicity-adjusted nor simultaneous; Holm-adjusted decisions are reported separately. These task-decoder endpoints are not downstream language-model behavior, and a passing decoder battery does not prove concept erasure. The pilot's calibration-frozen orientation, AlterRep, and fresh-MLP compatibility endpoints remain reported in Appendix~\ref{app:pilot-compatibility}.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/fig_construct_panel.pdf}
+  \caption{Pilot-plus-confirmatory construct panel. Points summarize the fixed 60 dependent candidate edits in each cell; horizontal segments are marginal one-sided 95\% lower bounds, with edge arrows for nonfinite conservative bounds. Dashed lines mark the locked accuracy, target-recovery, and control-retention thresholds. The diamond is the descriptive pilot and is excluded from Holm adjustment; N/E marks a nonestimable cell without assigning it an endpoint value.}
+  \label{fig:construct-panel}
+\end{figure}
 % END POST-RUN CONSTRUCT-PANEL UPDATE
 
 \paragraph{Candidate-conditioned diagnostic.}
@@ -189,7 +202,7 @@ $\Dcand$ projects the leading right-singular direction of each candidate's logit
 The scope is narrow: the benchmark is internal and unpublished, WinoGender is small and flawed, 34 of 90 Phase-2 cells are excluded, model--task data are reused across layers, and no downstream language-model behavior is measured. The candidate diagnostic removes one direction, protects one control, and fails its nonlinear synthetic gate. These facts rule out claims about erasure, prevalence, or Hessian geometry in general.
 
 % BEGIN POST-RUN CONSTRUCT-SCOPE UPDATE
-The original archives still lack Phase-2 per-example predictions, edited representations for fresh-decoder training, failed layer-evaluator accuracies, and Hessian eigenvectors. New extension artifacts support the disclosed pilot and prospective middle-layer construct panel, but do not repair the historical archive or turn task-decoder recovery into evidence about downstream model behavior. The finite decoder battery remains a falsification check and cannot establish erasure.
+The original archives still lack Phase-2 per-example predictions, edited representations for fresh-decoder training, failed layer-evaluator accuracies, and Hessian eigenvectors. The new extension artifacts support the disclosed pilot and prospective middle-layer construct panel, but do not repair the historical archive or turn task-decoder recovery into evidence about downstream language-model behavior. The finite decoder battery remains a falsification check and does not prove concept erasure.
 % END POST-RUN CONSTRUCT-SCOPE UPDATE
 
 Invalid scores can support false claims about concept removal, bias mitigation, or safety. Here, the same AlterRep edit appears nearly complete under its generating decoder and substantially weaker under a split evaluator, invalidating the score as a probe-quality target. Similar claims should first trace the scored object, separate editing from evaluation, test inversion and redecodability, and align inference with shared data.
