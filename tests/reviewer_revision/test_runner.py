@@ -24,6 +24,8 @@ from src.reviewer_revision.extension_config import ConstructCell
 from src.reviewer_revision.runner import (
     MANUSCRIPT_TEMPLATE_PATH,
     MANUSCRIPT_TEMPLATE_TEXT_SHA256,
+    WORKSHOP_LIMIT_SOURCE,
+    WORKSHOP_MAIN_TEXT_PAGE_LIMIT,
     _augment_matched_artifacts,
     _construct_candidate_device,
     _construct_row_base,
@@ -725,6 +727,11 @@ def test_workshop_main_text_page_count_stops_before_references():
     assert _main_text_page_count_from_text(pages) == 3
     with pytest.raises(ValueError, match="References"):
         _main_text_page_count_from_text(["Title", "Methods"])
+
+
+def test_workshop_page_gate_targets_lp4fm_full_paper_limit():
+    assert WORKSHOP_MAIN_TEXT_PAGE_LIMIT == 9
+    assert WORKSHOP_LIMIT_SOURCE == "https://lp4fm.github.io/"
 
 
 @pytest.mark.parametrize(

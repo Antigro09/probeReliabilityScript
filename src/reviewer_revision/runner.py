@@ -109,6 +109,8 @@ MANUSCRIPT_TEMPLATE_PATH = (
 MANUSCRIPT_TEMPLATE_TEXT_SHA256 = (
     "2711f7237be32b4d5cb86d5db02425606988760c8b278009f59e01c2a8a09cf1"
 )
+WORKSHOP_MAIN_TEXT_PAGE_LIMIT = 9
+WORKSHOP_LIMIT_SOURCE = "https://lp4fm.github.io/"
 
 _PILOT_CONSTRUCT_CELL = ConstructCell(
     "qwen",
@@ -5664,7 +5666,7 @@ def _compile_manuscript(context: RunContext) -> dict[str, Any]:
             )
         page_texts.append(_decode_pdftotext_output(extraction.stdout))
     main_text_pages = _main_text_page_count_from_text(page_texts)
-    workshop_main_text_limit = 5
+    workshop_main_text_limit = WORKSHOP_MAIN_TEXT_PAGE_LIMIT
     if main_text_pages > workshop_main_text_limit:
         raise RuntimeError(
             "workshop main-text page limit exceeded: "
@@ -5678,9 +5680,7 @@ def _compile_manuscript(context: RunContext) -> dict[str, Any]:
         "pages": page_count,
         "main_text_pages": main_text_pages,
         "workshop_main_text_page_limit": workshop_main_text_limit,
-        "workshop_limit_source": (
-            "https://interpretability4discovery.github.io/cfp.html"
-        ),
+        "workshop_limit_source": WORKSHOP_LIMIT_SOURCE,
         "maximum_overfull_hbox_pt": max(overfull) if overfull else 0.0,
         "undefined_references_or_citations": False,
         "pdfinfo": info,
