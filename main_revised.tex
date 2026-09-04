@@ -24,12 +24,31 @@
 
 % Central empirical results. The post-run agent should update these commands
 % from generated result artifacts rather than editing numeric claims in prose.
-\newcommand{\SplitCells}{12}
-\newcommand{\SplitMatched}{0.983}
-\newcommand{\SplitIndependent}{0.640}
-\newcommand{\SplitGap}{0.343}
-\newcommand{\SplitCI}{$[0.164,0.527]$}
-\newcommand{\SplitP}{.0156}
+\newcommand{\SplitCells}{60}
+\newcommand{\SplitBlocks}{12}
+\newcommand{\SplitPairs}{300}
+\newcommand{\SplitAnalyzedCells}{59}
+\newcommand{\SplitAnalyzedPairs}{289}
+\newcommand{\SplitScoreNullPairs}{11}
+\newcommand{\SplitMatched}{0.911}
+\newcommand{\SplitIndependent}{0.586}
+\newcommand{\SplitGap}{0.325}
+\newcommand{\SplitCI}{$[0.193, 0.467]$}
+\newcommand{\SplitP}{0.000977}
+\newcommand{\FGSMArchivedMatched}{1.000}
+\newcommand{\FGSMArchivedSplit}{0.985}
+\newcommand{\FGSMCeilingExit}{0.25}
+\newcommand{\PGDArchivedMatched}{1.000}
+\newcommand{\PGDArchivedSplit}{0.985}
+\newcommand{\PGDCeilingExit}{0.25}
+\newcommand{\ConstructCell}{Qwen2.5-1.5B / SST-2 / layer 14}
+\newcommand{\ConstructCandidates}{60}
+\newcommand{\ConstructRawMedian}{0.170}
+\newcommand{\ConstructOrientedMedian}{0.170}
+\newcommand{\ConstructFreshLinear}{0.826}
+\newcommand{\ConstructFreshMLP}{0.833}
+\newcommand{\ConstructFreshLinearBaseline}{0.856}
+\newcommand{\ConstructFreshMLPBaseline}{0.854}
 \newcommand{\BugFilteredN}{2{,}000}
 \newcommand{\BugFilteredMedian}{0.998}
 \newcommand{\BugFilteredCeiling}{26\%}
@@ -44,14 +63,14 @@
 \maketitle
 
 \begin{abstract}
-Intervention-based probe rankings can mistake damage to a downstream decoder for evidence that a candidate probe found a causally important direction. We audit a multi-model NLP pipeline in which the decoder both supplies an edit and scores it, while the reported target is constant across candidates. In a registered matched-versus-split control over \SplitCells{} model--task cells, AlterRep target damage falls from \SplitMatched{} under the generating decoder to \SplitIndependent{} under a separately trained evaluator (gap \SplitGap{}, 95\% cell-bootstrap interval \SplitCI{}; exact sign-flip $p=\SplitP$). After excluding all records affected by three implementation bugs, \BugFilteredN{} records remain: the cell score has median \BugFilteredMedian{}, \BugFilteredCeiling{} are exactly $1.0$, and AlterRep is the first maximizer in \BugFilteredAlterRep{}. We derive a five-part scored-object validity protocol and run prespecified perturbation-budget, orientation, and fresh-decoder checks. Fixed-decoder damage alone is not evidence of concept erasure or probe reliability.
+Intervention-based probe rankings can mistake damage to a downstream decoder for evidence that a candidate probe found a causally important direction. We audit a multi-model NLP pipeline in which the decoder both supplies an edit and scores it, while the reported target is constant across candidates. In a registered matched-versus-split control over 60 requested model--layer--task cells (59 analyzable) nested in 12 model--task blocks, AlterRep target damage falls from \SplitMatched{} under the generating decoder to \SplitIndependent{} under a separately trained evaluator (gap \SplitGap{}, 95\% hierarchical block-bootstrap interval \SplitCI{}; exact block sign-flip $p=\SplitP$). After excluding all records affected by three implementation bugs, \BugFilteredN{} records remain: the cell score has median \BugFilteredMedian{}, \BugFilteredCeiling{} are exactly $1.0$, and AlterRep is the first maximizer in \BugFilteredAlterRep{}. We derive a five-part scored-object validity protocol and run prespecified perturbation-budget, orientation, and fresh-decoder checks. Fixed-decoder damage alone is not evidence of concept erasure or probe reliability.
 \end{abstract}
 
 \section{Introduction}
 
 A probe-ranking target is useful only if it measures the candidate being ranked. In causal probing, a score can instead describe the edit, evaluator, or representation. We trace those dependencies before interpreting correlations with probe properties.
 
-Our central control isolates one such failure mode. AlterRep uses a decoder-derived direction to edit a representation. When the same decoder also scores that edit, mean target damage is \SplitMatched{}. Replacing it with a separately trained split evaluator reduces mean damage to \SplitIndependent{}, a gap of \SplitGap{} across \SplitCells{} model--task cells. The 95\% cell-bootstrap interval is \SplitCI{}, and an exact two-sided sign-flip test gives $p=\SplitP$. The edit is unchanged; only the scoring decoder changes.
+Our central control isolates one such failure mode. AlterRep uses a decoder-derived direction to edit a representation. When the same decoder also scores that edit, mean target damage is \SplitMatched{}. Replacing it with a separately trained split evaluator reduces mean damage to \SplitIndependent{}, an available-case gap of \SplitGap{} across 59 analyzable cells from 60 requested model--layer--task cells nested in 12 model--task blocks. The 95\% hierarchical block-bootstrap interval is \SplitCI{}, and the primary exact two-sided block sign-flip test gives $p=\SplitP$. The edit is unchanged; only the scoring decoder changes.
 
 Three bugs affected model states, labels, or candidate duplication: a padding error collapsed Gemma states, WinoGender preprocessing removed the disambiguating pronoun, and a no-gradient kernel duplicated two MLP variants. Removing every affected Phase-1 row leaves the abstract's bug-filtered result unchanged. The benchmark is an internal, unpublished adaptation of \citet{canby2025reliable}; unlike their intervention-level framework, it reuses fixed probes, maximizes across methods, and copies one cell score to every candidate. We audit only this adaptation.
 
@@ -79,19 +98,26 @@ Inferential support & Map shared data, exclusions, and clusters & Resample indep
 \section{Evaluator reuse changes measured damage}
 \label{sec:split}
 
-The matched-versus-split control holds the edit fixed and changes only the evaluator. For each of six models, we use the middle layer on SVA and SST-2. Five independently seeded attacker/evaluator pairs train on sentence-disjoint examples. The attacker generates each edit. The edited representations are then scored either by that attacker (matched) or by its paired evaluator (split). We average the five pair-level contrasts within each model--task cell and conduct inference over the \SplitCells{} cell means.
+The matched-versus-split control holds each edited tensor fixed and changes only the evaluator. For each of six models, we use 5 prespecified sampled layers on SVA and SST-2. Five independently seeded attacker/evaluator pairs train on sentence-disjoint examples. The attacker generates each edit, and both conditions score its identical tensor. We average the five pair contrasts within each model--layer--task cell and use the 12 model--task blocks as the independent units for primary inference (300 requested pair units total). The locked denominator floor yielded 11 affected pair units; all 300 requested pairs remain in the row artifact, while both conditions of each affected pair are excluded symmetrically, leaving 289 pairs and 59 analyzable cells in the available-case estimand. 1 requested cell is explicitly non-estimable.
 
-AlterRep's mean target damage drops from \SplitMatched{} to \SplitIndependent{}. The mean paired gap is \SplitGap{}, with a 95\% cell-bootstrap interval of \SplitCI{} and exact two-sided sign-flip $p=\SplitP$. All seven nonzero cell gaps are positive; the other five are zero. The effect varies across model--task cells. Because the edited representations are held fixed, the gap identifies evaluator reuse as a source of measured damage in this pipeline.
+Across 59 analyzable, equally weighted model--layer--task cells from 60 requested cells, AlterRep mean target damage drops from \SplitMatched{} to \SplitIndependent{}. The mean paired gap is \SplitGap{}, with a 95\% hierarchical block-bootstrap interval of \SplitCI{} and primary exact two-sided block sign-flip $p=\SplitP$. Because both conditions score the identical edited tensor, the gap identifies evaluator reuse as a source of measured damage in this pipeline. The estimate uses 289 complete pairs; the 11 denominator-floor pairs remain explicit in the row artifact with both conditions excluded symmetrically.
 
 % BEGIN POST-RUN EPSILON-SWEEP UPDATE
-% Replace the preceding FGSM/PGD limitation paragraph, or append to it, only
-% after the sweep artifacts and plots specified in the handoff pass validation.
+\paragraph{Perturbation-budget sweep.}
+At the archived $\epsilon=0.5$ budget, FGSM has matched and split damage \FGSMArchivedMatched{} and \FGSMArchivedSplit{}, while PGD has \PGDArchivedMatched{} and \PGDArchivedSplit{}. The prespecified curves do not jointly show an archived-budget ceiling and split-evaluator damage leaving that ceiling at a lower budget. The sweep therefore does not support attributing the archived saturation to perturbation magnitude alone. No large nonmonotonic reversal exceeds the predeclared 0.100 threshold; this diagnostic is reported separately from the perturbation-budget interpretation. The locked denominator floor produced 260 null score rows across 220 paired epsilon units; both scoring conditions of every affected unit remain in the row artifact and are excluded symmetrically from curve estimates. This makes 40 requested curve cells non-estimable; all model--task blocks remain represented.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/fig_epsilon_sweep.pdf}
+  \caption{FGSM and PGD over the complete prespecified $\epsilon$ grid. Curves show equal-cell mean target damage with 95\% model--task cluster intervals; the companion rows show the fraction of pair units at $C=1$. The dotted vertical line marks the archived $\epsilon=0.5$ setting, and zero is the separately plotted no-op point.}
+  \label{fig:epsilon-sweep}
+\end{figure}
 % END POST-RUN EPSILON-SWEEP UPDATE
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=0.92\linewidth]{figures/fig_circularity.pdf}
-  \caption{Matched-versus-split scoring across \SplitCells{} model--task cells. AlterRep damage falls when the split evaluator scores the attacker's edit. FGSM and PGD are saturated at the configured perturbation budget. Horizontal marks show grand means.}
+  \includegraphics[width=\linewidth]{figures/fig_circularity_expanded.pdf}
+  \caption{Matched-versus-split AlterRep target damage for 59 analyzable cells from 60 requested model--layer--task cells nested in 12 model--task blocks. Panel A shows paired cell means for the identical edits; the grand matched and split means are \SplitMatched{} and \SplitIndependent{}. Panel B shows all block depth trajectories and the equal-block mean gap with a 95\% hierarchical interval. Denominator-floor nulls affect 11 of 300 requested pair units and are excluded symmetrically.}
   \label{fig:coupling}
 \end{figure}
 
@@ -142,9 +168,15 @@ Table~\ref{tab:protocol} turns the observed failure modes into checks that can r
 We ran the candidate-identity, evaluator-separation, saturation, data-overlap, and dependence-aware inference checks. Archived outputs lacked the per-example artifacts needed for retrospective orientation and fresh-decoder tests; the revision follow-up below evaluates them in one prespecified cell.
 
 % BEGIN POST-RUN ORIENTATION-REDECODABILITY UPDATE
-% Replace the preceding paragraph only after the prespecified one-cell analysis
-% has saved per-example predictions, edited states, split manifests, and fresh-
-% decoder results, and after all leakage tests in the handoff pass.
+\paragraph{Prespecified construct check.}
+In the prespecified \ConstructCell{} follow-up, orientation calibration changed median fixed-evaluator damage from \ConstructRawMedian{} to \ConstructOrientedMedian{} across \ConstructCandidates{} candidate edits. Fresh linear decoders reached median final-test accuracy \ConstructFreshLinear{} on edited states versus their \ConstructFreshLinearBaseline{} unedited baseline; fresh MLP decoders reached \ConstructFreshMLP{} versus \ConstructFreshMLPBaseline{}. No materiality threshold or inferential recovery rule was predeclared, so these fresh-decoder comparisons remain descriptive. The calibration-frozen orientation endpoints do not identify label inversion in this cell; they do not establish erasure elsewhere. Orientation was selected only on the disjoint calibration split and frozen for final-test evaluation.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/fig_orientation_redecodability.pdf}
+  \caption{Construct checks for the 60 prespecified candidate-conditioned edits in Qwen2.5-1.5B/SST-2/layer 14. Panels align raw fixed-evaluator damage, calibration-frozen orientation damage, and fresh linear/MLP target-label accuracy. Horizontal marks denote medians; every point is one candidate edit.}
+  \label{fig:orientation-redecodability}
+\end{figure}
 % END POST-RUN ORIENTATION-REDECODABILITY UPDATE
 
 \paragraph{Candidate-conditioned diagnostic.}
@@ -154,7 +186,7 @@ $\Dcand$ projects the leading right-singular direction of each candidate's logit
 
 The scope is narrow: the benchmark is internal and unpublished, WinoGender is small and flawed, 34 of 90 Phase-2 cells are excluded, model--task data are reused across layers, and no downstream language-model behavior is measured. The candidate diagnostic removes one direction, protects one control, and fails its nonlinear synthetic gate. These facts rule out claims about erasure, prevalence, or Hessian geometry in general.
 
-The original archives also lack Phase-2 per-example predictions, edited representations for fresh-decoder training, failed layer-evaluator accuracies, and Hessian eigenvectors. Orientation and post-edit redecodability are therefore untested in the archived study. We include them in Table~\ref{tab:protocol} because they are necessary falsification checks, not because our pipeline satisfied them.
+The original archives still lack Phase-2 per-example predictions, edited representations for fresh-decoder training, failed layer-evaluator accuracies, and Hessian eigenvectors. Orientation and fresh-decoder recovery were tested in one prespecified model--layer--task cell in the revision follow-up; the original archive and the remaining cells still lack these endpoints. The one-cell result is a falsification check, not evidence of erasure elsewhere.
 
 Invalid scores can support false claims about concept removal, bias mitigation, or safety. Here, the same AlterRep edit appears nearly complete under its generating decoder and substantially weaker under a split evaluator, invalidating the score as a probe-quality target. Similar claims should first trace the scored object, separate editing from evaluation, test inversion and redecodability, and align inference with shared data.
 
@@ -189,7 +221,7 @@ Spearman correlation is Pearson correlation of midranks, so its covariance numer
 Each model--layer--task cell uses the same extracted representations, target labels, control labels, fixed target/control evaluators, and five interventions for all 60 candidates. The candidate probes differ by architecture and seed. The audited target is the maximum in Eq.~\ref{eq:phase1}. The original prediction used raw mean absolute cosine between flattened probe parameters and the top 20 Hessian eigenvectors. That statistic changes with parameter dimension and with the basis chosen inside repeated eigenspaces, so the failed re-test cannot answer a basis-invariant geometry question.
 
 \paragraph{Matched-versus-split control.}
-For each of six models, we use the middle layer for SVA and SST-2. Five seeded attacker/evaluator pairs train on separate examples. The attacker generates each edit. Target and control damage are then scored once by that attacker and once by its paired evaluator. We compute the primary AlterRep contrast on the \SplitCells{} cell means. The reported percentile interval resamples cells with replacement; the exact sign-flip test flips the sign of each nonzero paired cell difference. A second bootstrap that resamples both cells and the five within-cell pairs gives $[0.164,0.529]$.
+For each of six models, we use 5 prespecified sampled layers for SVA and SST-2. Five seeded attacker/evaluator pairs train on separate sentence groups. Each attacker generates one edit that is hashed and scored unchanged by its matched and split evaluators, yielding 300 pair units in 60 cells nested in 12 model--task blocks. The locked denominator floor excludes both conditions for 11 affected pairs from numerical summaries (289 analyzed pairs and 59 analyzable cells) while retaining every requested row and reason in the artifact. We average valid pairs within cells and layers within equally weighted blocks. The primary 95\% interval hierarchically resamples model--task blocks, layers, and pairs; the primary exact sign-flip test flips the nonzero block contrasts.
 
 \paragraph{Candidate diagnostic.}
 A four-way sentence-disjoint split assigns 40\% of examples to candidate fitting, 20\% to evaluator fitting, 30\% to direction estimation and scoring, and 10\% to candidate testing. A model--task run must pass middle-layer target/control learnability and shuffled-label gates. Each layer then requires five bagged target/control evaluators above $0.60$ out-of-bag accuracy; denominators must exceed a $0.55$ floor. The run yields 3,360 candidate records from 56 of 90 possible cells. Fifteen cells fail model--task gates and 19 fail layer-evaluator gates. Fourteen of the latter occur at the first two sampled layers. Only Pythia and GPT-2 contribute WinoGender cells.
