@@ -14,6 +14,13 @@ from src.reviewer_revision.experiments import (
     validate_unique_rows,
 )
 
+ARCHIVE_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "assets"
+    / "reviewer_revision"
+    / "attacker_evaluator_reference.json"
+)
+
 
 class _AxisProbe(torch.nn.Module):
     def __init__(self, axis: int, sign: float = 1.0):
@@ -72,8 +79,7 @@ def test_duplicate_scientific_row_key_is_rejected():
 
 
 def test_archived_fixture_reproduces_locked_aggregate():
-    archive = Path("results/ws4/attacker_evaluator.json")
-    summary = archived_baseline_summary(archive)
+    summary = archived_baseline_summary(ARCHIVE_PATH)
     assert summary["n_cells"] == 12
     assert summary["matched"] == pytest.approx(0.9829058376336399, abs=1e-15)
     assert summary["split"] == pytest.approx(0.639718191210888, abs=1e-15)
@@ -85,7 +91,7 @@ def test_archived_fixture_reproduces_locked_aggregate():
 
 
 def test_archived_gate_recomputes_pair_arrays_and_rejects_stale_stored_means(tmp_path):
-    payload = json.loads(Path("results/ws4/attacker_evaluator.json").read_text(encoding="utf-8"))
+    payload = json.loads(ARCHIVE_PATH.read_text(encoding="utf-8"))
     first_cell = next(iter(payload["cells"].values()))
     first_cell["methods"]["AlterRep"]["matched_C_mean"] = 0.123
     path = tmp_path / "stale-mean.json"
@@ -96,7 +102,7 @@ def test_archived_gate_recomputes_pair_arrays_and_rejects_stale_stored_means(tmp
 
 
 def test_archived_gate_rejects_missing_attack_ceiling_pair(tmp_path):
-    payload = json.loads(Path("results/ws4/attacker_evaluator.json").read_text(encoding="utf-8"))
+    payload = json.loads(ARCHIVE_PATH.read_text(encoding="utf-8"))
     first_cell = next(iter(payload["cells"].values()))
     first_cell["methods"]["PGD"]["split_C_pairs"][0] = 0.99
     first_cell["methods"]["PGD"]["split_C_mean"] = 0.998
@@ -108,10 +114,9 @@ def test_archived_gate_rejects_missing_attack_ceiling_pair(tmp_path):
 
 
 def test_retrained_baseline_gate_compares_current_pair_outputs(tmp_path):
-    archive = Path("results/ws4/attacker_evaluator.json")
-    current = json.loads(archive.read_text(encoding="utf-8"))
+    current = json.loads(ARCHIVE_PATH.read_text(encoding="utf-8"))
 
-    report = validate_retrained_baseline(archive, current)
+    report = validate_retrained_baseline(ARCHIVE_PATH, current)
 
     assert report["status"] == "ok"
     assert report["current"]["fgsm_pgd_ceiling_pair_values"] == 240
@@ -124,4 +129,4 @@ def test_retrained_baseline_gate_compares_current_pair_outputs(tmp_path):
         "matched_C_mean"
     ]
     with pytest.raises(ValueError, match="aggregate tolerance|sign pattern"):
-        validate_retrained_baseline(archive, current)
+        validate_retrained_baseline(ARCHIVE_PATH, current)

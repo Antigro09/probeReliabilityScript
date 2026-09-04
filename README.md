@@ -42,6 +42,10 @@ work. The reviewer runner consumes and preflight-validates existing caches;
 Silicon and otherwise records a CPU fallback. It never moves the locked small
 scientific probes, edits, fresh decoders, or statistics off CPU.
 
+The compact archived attacker/evaluator reference used by the locked
+reproduction gate lives under `assets/reviewer_revision/`; generated run
+directories remain local under `results/` and are excluded from the release.
+
 ```powershell
 # First invocation: creates a new immutable timestamped run directory.
 .\.venv\Scripts\python.exe -m scripts.run_reviewer_revision all `

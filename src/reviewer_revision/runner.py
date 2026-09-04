@@ -97,7 +97,12 @@ from .training import (
 LOGGER = logging.getLogger("reviewer_revision")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CACHE_ROOT = PROJECT_ROOT / "cache" / "benchmark_v2"
-ARCHIVE_PATH = PROJECT_ROOT / "results" / "ws4" / "attacker_evaluator.json"
+ARCHIVE_PATH = (
+    PROJECT_ROOT
+    / "assets"
+    / "reviewer_revision"
+    / "attacker_evaluator_reference.json"
+)
 MANUSCRIPT_TEMPLATE_PATH = (
     PROJECT_ROOT / "assets" / "reviewer_revision" / "main_revised_prepatch.tex"
 )
