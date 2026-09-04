@@ -49,6 +49,14 @@ results/robustness_v3_smoke/
 results/reviewer_revision_2026_08/
 results/reviewer_caveat_extension_2026_08/
 
+# Generated manuscript inputs and delivery bundles
+extension_numbers.tex
+figures/fig_construct_panel.pdf
+figures/fig_construct_panel.png
+figures/fig_floor_sensitivity.pdf
+figures/fig_floor_sensitivity.png
+deliverables/
+
 # Local workshop manuscript builds (source and checked-in figure assets remain tracked)
 main_revised.aux
 main_revised.bbl
