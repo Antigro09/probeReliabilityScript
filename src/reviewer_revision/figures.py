@@ -7,6 +7,7 @@ vector PDF plus a 300-DPI PNG with the same deterministic plotting logic.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Mapping, Sequence
@@ -1038,11 +1039,372 @@ def generate_revision_figures(
     }
 
 
+def _validated_extension_payload(
+    source: str | Path | Mapping[str, Any],
+) -> dict[str, Any]:
+    if isinstance(source, Mapping):
+        payload = dict(source)
+    else:
+        path = Path(source)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise FigureValidationError(
+                f"could not load extension summary: {exc}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise FigureValidationError("extension summary must contain an object")
+    from .paper import ManuscriptValidationError, validate_extension_summary
+
+    try:
+        validate_extension_summary(payload)
+    except ManuscriptValidationError as exc:
+        raise FigureValidationError(str(exc)) from exc
+    return payload
+
+
+def _summary_number(
+    record: Mapping[str, Any], *names: str, location: str
+) -> float:
+    for name in names:
+        value = record.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric = float(value)
+            if math.isfinite(numeric):
+                return numeric
+    raise FigureValidationError(
+        f"{location} requires one finite numeric field from {list(names)!r}"
+    )
+
+
+def create_floor_sensitivity_figure(
+    summary: str | Path | Mapping[str, Any],
+    output_directory: str | Path,
+    *,
+    stem: str = "fig_floor_sensitivity",
+) -> FigureArtifacts:
+    """Render the complete post-hoc floor curve and full-case companion."""
+
+    payload = _validated_extension_payload(summary)
+    robustness = dict(payload["floor_robustness"])
+    curve = pd.DataFrame(robustness["floor_curve"]).sort_values(
+        "floor", kind="mergesort"
+    )
+    floors = curve["floor"].to_numpy(dtype=float)
+    gaps = curve["gap"].to_numpy(dtype=float)
+    pair_column = "analyzed_pairs" if "analyzed_pairs" in curve else "pairs"
+    pairs = curve[pair_column].to_numpy(dtype=int)
+    partial = dict(robustness["partial_identification"])
+    raw = dict(robustness["full_case_raw_drop"])
+    raw_gap = _summary_number(raw, "gap", location="full_case_raw_drop")
+    categories = np.arange(len(floors) + 1, dtype=float)
+    floor_positions = categories[1:]
+    locked_position = floor_positions[
+        int(np.flatnonzero(np.isclose(floors, 0.55))[0])
+    ]
+
+    _publication_style()
+    figure, (gap_axis, coverage_axis) = plt.subplots(
+        2,
+        1,
+        figsize=(4.8, 3.65),
+        sharex=True,
+        gridspec_kw={"height_ratios": (2.2, 1.0), "hspace": 0.08},
+    )
+    gap_axis.plot(
+        floor_positions,
+        gaps,
+        color=OKABE_ITO["blue"],
+        marker="o",
+        markersize=4.0,
+        label="Normalized-damage gap",
+    )
+    gap_axis.axvline(
+        locked_position,
+        color=OKABE_ITO["gray"],
+        linestyle="--",
+        linewidth=0.8,
+    )
+    gap_axis.plot(
+        [locked_position, locked_position],
+        [float(partial["lower"]), float(partial["upper"])],
+        color=OKABE_ITO["yellow"],
+        linewidth=5.0,
+        alpha=0.7,
+        label="Locked-floor partial-ID bound",
+    )
+    gap_axis.scatter(
+        [categories[0]],
+        [raw_gap],
+        marker="D",
+        s=22,
+        color=OKABE_ITO["vermillion"],
+        label="Full-case raw-drop gap",
+        zorder=4,
+    )
+    gap_axis.set_ylabel("Matched - split gap")
+    gap_axis.legend(loc="best", ncol=1)
+    gap_axis.text(
+        -0.13,
+        1.02,
+        "A",
+        transform=gap_axis.transAxes,
+        fontweight="bold",
+        va="bottom",
+    )
+
+    coverage_axis.plot(
+        floor_positions,
+        pairs,
+        color=OKABE_ITO["green"],
+        marker="s",
+        markersize=3.7,
+    )
+    coverage_axis.scatter(
+        [categories[0]],
+        [300],
+        marker="D",
+        s=18,
+        color=OKABE_ITO["vermillion"],
+        zorder=3,
+    )
+    coverage_axis.axvline(
+        locked_position,
+        color=OKABE_ITO["gray"],
+        linestyle="--",
+        linewidth=0.8,
+    )
+    coverage_axis.set_xlabel("Analysis / pre-edit target-accuracy floor")
+    coverage_axis.set_ylabel("Analyzed\npairs")
+    coverage_axis.set_xticks(categories)
+    coverage_axis.set_xticklabels(
+        ["Raw drop\n(no floor)", "0.50+", "0.525", "0.55", "0.575", "0.60"]
+    )
+    coverage_axis.set_ylim(0, max(300, int(pairs.max())) * 1.08)
+    coverage_axis.text(
+        -0.13,
+        1.02,
+        "B",
+        transform=coverage_axis.transAxes,
+        fontweight="bold",
+        va="bottom",
+    )
+    metadata = {
+        "post_hoc_sensitivity": True,
+        "replaces_registered_primary": False,
+        "floors": floors.tolist(),
+        "locked_floor": 0.55,
+        "analyzed_pairs": pairs.tolist(),
+        "full_case_raw_drop_gap": raw_gap,
+        "full_case_raw_drop_has_separate_no_floor_category": True,
+        "partial_identification_bound": [
+            float(partial["lower"]),
+            float(partial["upper"]),
+        ],
+        "partial_identification_is_confidence_interval": False,
+    }
+    return _save(figure, output_directory, stem, metadata)
+
+
+def create_construct_panel_figure(
+    summary: str | Path | Mapping[str, Any],
+    output_directory: str | Path,
+    *,
+    stem: str = "fig_construct_panel",
+) -> FigureArtifacts:
+    """Render locked cell endpoints with honest marginal one-sided bounds."""
+
+    payload = _validated_extension_payload(summary)
+    construct = dict(payload["construct_panel"])
+    cells = dict(construct["cells"])
+    ordered = sorted(
+        cells.items(),
+        key=lambda item: (
+            str(item[1]["cell"]["task"]),
+            str(item[1]["cell"]["model_key"]),
+        ),
+    )
+    labels = [
+        f"{record['cell']['model_key']} / {str(record['cell']['task']).upper()}"
+        for _, record in ordered
+    ]
+    endpoint_specs = (
+        ("median_target_post_edit_accuracy", "accuracy", "Post-edit target accuracy", 0.55),
+        (
+            "median_target_recovery_ratio",
+            "target_recovery_ratio",
+            "Target recovery ratio",
+            0.50,
+        ),
+        (
+            "median_control_retention_ratio",
+            "control_retention_ratio",
+            "Control retention ratio",
+            0.80,
+        ),
+    )
+    _publication_style()
+    figure, axes = plt.subplots(
+        1,
+        3,
+        figsize=(7.15, 4.35),
+        sharey=True,
+        gridspec_kw={"wspace": 0.12},
+    )
+    y = np.arange(len(ordered), dtype=float)
+    nonestimable: list[str] = []
+    nonfinite_bounds: list[str] = []
+    for axis, (endpoint_name, bound_name, label, threshold) in zip(
+        axes, endpoint_specs, strict=True
+    ):
+        axis.axvline(
+            threshold,
+            color=OKABE_ITO["gray"],
+            linestyle="--",
+            linewidth=0.8,
+        )
+        for position, (slug, record) in enumerate(ordered):
+            if record["status"] != "ok":
+                if slug not in nonestimable:
+                    nonestimable.append(slug)
+                axis.text(
+                    0.015,
+                    position,
+                    "N/E",
+                    transform=axis.get_yaxis_transform(),
+                    color=OKABE_ITO["gray"],
+                    fontsize=6.5,
+                    ha="left",
+                    va="center",
+                )
+                continue
+            point = float(record["endpoints"][endpoint_name])
+            if record["confirmatory"]:
+                finite = bool(record["marginal_lower_bound_finite"][bound_name])
+                if finite:
+                    lower = float(record["marginal_lower_bounds"][bound_name])
+                    axis.plot(
+                        [lower, point],
+                        [position, position],
+                        color=OKABE_ITO["blue"],
+                        linewidth=1.2,
+                    )
+                else:
+                    nonfinite_bounds.append(f"{slug}:{bound_name}")
+                    axis.annotate(
+                        "",
+                        xy=(0.0, position),
+                        xycoords=("axes fraction", "data"),
+                        xytext=(point, position),
+                        textcoords=("data", "data"),
+                        arrowprops={
+                            "arrowstyle": "->",
+                            "color": OKABE_ITO["blue"],
+                            "linewidth": 1.0,
+                            "linestyle": ":",
+                        },
+                    )
+                axis.scatter(
+                    [point],
+                    [position],
+                    marker="o",
+                    facecolor=OKABE_ITO["blue"],
+                    edgecolor="white",
+                    linewidth=0.3,
+                    s=24,
+                    zorder=3,
+                )
+            else:
+                axis.scatter(
+                    [point],
+                    [position],
+                    marker="D",
+                    facecolor=OKABE_ITO["vermillion"],
+                    edgecolor="white",
+                    linewidth=0.3,
+                    s=28,
+                    zorder=4,
+                )
+        axis.set_xlabel(label)
+        axis.set_xlim(left=min(-0.05, axis.get_xlim()[0]), right=max(1.05, axis.get_xlim()[1]))
+    axes[0].set_yticks(y)
+    axes[0].set_yticklabels(labels)
+    axes[0].invert_yaxis()
+    legend: list[Line2D] = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color=OKABE_ITO["blue"],
+            label="Confirmatory point and marginal 95% lower bound",
+            markerfacecolor=OKABE_ITO["blue"],
+            linewidth=1.2,
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="D",
+            color="none",
+            label="Disclosed descriptive pilot",
+            markerfacecolor=OKABE_ITO["vermillion"],
+            markeredgecolor="white",
+        ),
+    ]
+    if nonfinite_bounds:
+        legend.append(
+            Line2D(
+                [0],
+                [0],
+                marker="<",
+                color=OKABE_ITO["blue"],
+                linestyle=":",
+                label="Nonfinite marginal lower bound (extends off scale)",
+            )
+        )
+    if nonestimable:
+        legend.append(
+            Line2D(
+                [0],
+                [0],
+                marker="x",
+                color=OKABE_ITO["gray"],
+                linestyle="None",
+                label="N/E: no estimable endpoint value",
+            )
+        )
+    figure.legend(handles=legend, loc="lower center", ncol=2, bbox_to_anchor=(0.5, -0.01))
+    figure.subplots_adjust(bottom=0.16)
+    pilot_slug = next(slug for slug, record in ordered if not record["confirmatory"])
+    metadata = {
+        "confirmatory_cells": int(construct["confirmatory_cell_count"]),
+        "pilot_cell": pilot_slug,
+        "passing_confirmatory_cells": int(
+            construct["passing_confirmatory_cell_count"]
+        ),
+        "nonestimable_confirmatory_cells": int(
+            construct["nonestimable_confirmatory_cell_count"]
+        ),
+        "bounds_are_marginal_not_simultaneous": True,
+        "holm_applies_to_cell_p_values_not_displayed_bounds": True,
+        "nonestimable_cells": nonestimable,
+        "nonestimable_cells_have_no_scientific_x_value": True,
+        "nonfinite_marginal_bounds": sorted(nonfinite_bounds),
+        "thresholds": {
+            "accuracy": 0.55,
+            "target_recovery_ratio": 0.50,
+            "control_retention_ratio": 0.80,
+        },
+    }
+    return _save(figure, output_directory, stem, metadata)
+
+
 __all__ = [
     "FigureArtifacts",
     "FigureValidationError",
     "create_construct_check_figure",
+    "create_construct_panel_figure",
     "create_epsilon_sweep_figure",
     "create_expanded_matched_split_figure",
+    "create_floor_sensitivity_figure",
     "generate_revision_figures",
 ]

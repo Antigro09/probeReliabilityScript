@@ -55,7 +55,7 @@
 \newcommand{\BugFilteredAlterRep}{72\%}
 
 \title{Evaluator Reuse Inflates Intervention Scores: A Validity Audit of Probe-Ranking Targets}
-\workshoptitle{Interpretability for Discovery}
+\workshoptitle{Linguistic Principles for Foundation Models}
 \author{Anonymous Authors}
 
 \begin{document}
@@ -63,12 +63,12 @@
 \maketitle
 
 \begin{abstract}
-Intervention-based probe rankings can mistake damage to a downstream decoder for evidence that a candidate probe found a causally important direction. We audit a multi-model NLP pipeline in which the decoder both supplies an edit and scores it, while the reported target is constant across candidates. In a registered matched-versus-split control over 60 requested model--layer--task cells (59 analyzable) nested in 12 model--task blocks, AlterRep target damage falls from \SplitMatched{} under the generating decoder to \SplitIndependent{} under a separately trained evaluator (gap \SplitGap{}, 95\% hierarchical block-bootstrap interval \SplitCI{}; exact block sign-flip $p=\SplitP$). After excluding all records affected by three implementation bugs, \BugFilteredN{} records remain: the cell score has median \BugFilteredMedian{}, \BugFilteredCeiling{} are exactly $1.0$, and AlterRep is the first maximizer in \BugFilteredAlterRep{}. We derive a five-part scored-object validity protocol and run prespecified perturbation-budget, orientation, and fresh-decoder checks. Fixed-decoder damage alone is not evidence of concept erasure or probe reliability.
+Intervention-based rankings of probes for linguistic structure can mistake damage to a downstream decoder for evidence that a candidate probe found a causally important direction. We audit a six-family foundation-model pipeline spanning subject--verb agreement, sentiment, and gender agreement, in which the decoder both supplies an edit and scores it while the reported target is constant across candidates. In a registered matched-versus-split control over 60 requested model--layer--task cells (59 analyzable) nested in 12 model--task blocks, AlterRep target damage falls from \SplitMatched{} under the generating decoder to \SplitIndependent{} under a separately trained evaluator (gap \SplitGap{}, 95\% hierarchical block-bootstrap interval \SplitCI{}; exact block sign-flip $p=\SplitP$). After excluding all records affected by three implementation bugs, \BugFilteredN{} records remain: the cell score has median \BugFilteredMedian{}, \BugFilteredCeiling{} are exactly $1.0$, and AlterRep is the first maximizer in \BugFilteredAlterRep{}. We derive a five-part scored-object validity protocol and run prespecified perturbation-budget, orientation, and fresh-decoder checks. Fixed-decoder damage alone is not evidence of concept erasure or probe reliability.
 \end{abstract}
 
 \section{Introduction}
 
-A probe-ranking target is useful only if it measures the candidate being ranked. In causal probing, a score can instead describe the edit, evaluator, or representation. We trace those dependencies before interpreting correlations with probe properties.
+Probes are widely used to infer whether foundation models encode linguistic structure. A probe-ranking target is useful only if it measures the candidate being ranked; in causal probing, a score can instead describe the edit, evaluator, or representation. We trace those dependencies before interpreting correlations with probe properties.
 
 Our central control isolates one such failure mode. AlterRep uses a decoder-derived direction to edit a representation. When the same decoder also scores that edit, mean target damage is \SplitMatched{}. Replacing it with a separately trained split evaluator reduces mean damage to \SplitIndependent{}, an available-case gap of \SplitGap{} across 59 analyzable cells from 60 requested model--layer--task cells nested in 12 model--task blocks. The 95\% hierarchical block-bootstrap interval is \SplitCI{}, and the primary exact two-sided block sign-flip test gives $p=\SplitP$. The edit is unchanged; only the scoring decoder changes.
 
@@ -101,6 +101,11 @@ Inferential support & Map shared data, exclusions, and clusters & Resample indep
 The matched-versus-split control holds each edited tensor fixed and changes only the evaluator. For each of six models, we use 5 prespecified sampled layers on SVA and SST-2. Five independently seeded attacker/evaluator pairs train on sentence-disjoint examples. The attacker generates each edit, and both conditions score its identical tensor. We average the five pair contrasts within each model--layer--task cell and use the 12 model--task blocks as the independent units for primary inference (300 requested pair units total). The locked denominator floor yielded 11 affected pair units; all 300 requested pairs remain in the row artifact, while both conditions of each affected pair are excluded symmetrically, leaving 289 pairs and 59 analyzable cells in the available-case estimand. 1 requested cell is explicitly non-estimable.
 
 Across 59 analyzable, equally weighted model--layer--task cells from 60 requested cells, AlterRep mean target damage drops from \SplitMatched{} to \SplitIndependent{}. The mean paired gap is \SplitGap{}, with a 95\% hierarchical block-bootstrap interval of \SplitCI{} and primary exact two-sided block sign-flip $p=\SplitP$. Because both conditions score the identical edited tensor, the gap identifies evaluator reuse as a source of measured damage in this pipeline. The estimate uses 289 complete pairs; the 11 denominator-floor pairs remain explicit in the row artifact with both conditions excluded symmetrically.
+
+% BEGIN POST-RUN FLOOR-SENSITIVITY UPDATE
+\paragraph{Denominator-floor robustness.}
+The registered available-case estimand remains primary. A separately labeled post-hoc analysis reports the full-case raw accuracy-drop contrast, every prespecified denominator floor, and a deterministic partial-identification bound at the locked floor.
+% END POST-RUN FLOOR-SENSITIVITY UPDATE
 
 % BEGIN POST-RUN EPSILON-SWEEP UPDATE
 \paragraph{Perturbation-budget sweep.}
@@ -152,7 +157,7 @@ The pipeline copies $\RPmax(g)$ to all 60 candidates in cell $g$, so each cell h
 
 \begin{proposition}[Cell-constant targets]
 \label{prop:constant}
-If $T(c,g)=t_g$ for every $c\in\mathcal C_g$, then $T$ induces a complete tie within each cell. Any pooled Spearman association between a candidate statistic $X$ and $T$ contains only between-cell information.
+Let $\mathcal G$ be a finite set of cells and let each $\mathcal C_g$ be a finite, nonempty candidate set. If $T(c,g)=t_g$ for every $g\in\mathcal G$ and $c\in\mathcal C_g$, then $T$ induces a complete tie within each cell. Any pooled Spearman association between a candidate statistic $X$ and $T$ contains only between-cell information.
 \end{proposition}
 
 The proof and weighting consequences appear in Appendix~\ref{app:proof}.
@@ -165,19 +170,16 @@ Across 5,400 records, 48.9\% equal $1.0$ and the median is $0.9999$; replacing t
 
 Table~\ref{tab:protocol} turns the observed failure modes into checks that can reject a ranking target before any correlation analysis. Passing every row removes the channels listed here; it does not prove that an edit captures the intended construct.
 
-We ran the candidate-identity, evaluator-separation, saturation, data-overlap, and dependence-aware inference checks. Archived outputs lacked the per-example artifacts needed for retrospective orientation and fresh-decoder tests; the revision follow-up below evaluates them in one prespecified cell.
+% BEGIN POST-RUN CONSTRUCT-CONTEXT UPDATE
+We ran the candidate-identity, evaluator-separation, saturation, data-overlap, and dependence-aware inference checks. The registered archive lacked per-example artifacts for retrospective orientation and fresh-decoder tests; a disclosed pilot and a separately registered prospective panel provide those follow-up checks without changing the original analysis.
+% END POST-RUN CONSTRUCT-CONTEXT UPDATE
 
+% BEGIN POST-RUN CONSTRUCT-PANEL UPDATE
 % BEGIN POST-RUN ORIENTATION-REDECODABILITY UPDATE
-\paragraph{Prespecified construct check.}
-In the prespecified \ConstructCell{} follow-up, orientation calibration changed median fixed-evaluator damage from \ConstructRawMedian{} to \ConstructOrientedMedian{} across \ConstructCandidates{} candidate edits. Fresh linear decoders reached median final-test accuracy \ConstructFreshLinear{} on edited states versus their \ConstructFreshLinearBaseline{} unedited baseline; fresh MLP decoders reached \ConstructFreshMLP{} versus \ConstructFreshMLPBaseline{}. No materiality threshold or inferential recovery rule was predeclared, so these fresh-decoder comparisons remain descriptive. The calibration-frozen orientation endpoints do not identify label inversion in this cell; they do not establish erasure elsewhere. Orientation was selected only on the disjoint calibration split and frozen for final-test evaluation.
-
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\linewidth]{figures/fig_orientation_redecodability.pdf}
-  \caption{Construct checks for the 60 prespecified candidate-conditioned edits in Qwen2.5-1.5B/SST-2/layer 14. Panels align raw fixed-evaluator damage, calibration-frozen orientation damage, and fresh linear/MLP target-label accuracy. Horizontal marks denote medians; every point is one candidate edit.}
-  \label{fig:orientation-redecodability}
-\end{figure}
+\paragraph{Construct follow-up.}
+The disclosed pilot compatibility endpoints remain in Appendix~\ref{app:pilot-compatibility}; the prospective panel replaces this placeholder after its exact-key validation gate passes.
 % END POST-RUN ORIENTATION-REDECODABILITY UPDATE
+% END POST-RUN CONSTRUCT-PANEL UPDATE
 
 \paragraph{Candidate-conditioned diagnostic.}
 $\Dcand$ projects the leading right-singular direction of each candidate's logit-difference Jacobian and scores the edit with five separately trained evaluators. This repairs candidate identity, maximum aggregation, and direct evaluator reuse, but not every validity condition. It recovers planted rankings in linear and held-out nonlinear synthetic families, yet 93.3\% of nonlinear scores lie within $0.02$ of one, above the registered 20\% saturation limit; the locked battery therefore rejects it. The real-data Hessian association ($\rho=-0.042$) remains descriptive.
@@ -186,9 +188,13 @@ $\Dcand$ projects the leading right-singular direction of each candidate's logit
 
 The scope is narrow: the benchmark is internal and unpublished, WinoGender is small and flawed, 34 of 90 Phase-2 cells are excluded, model--task data are reused across layers, and no downstream language-model behavior is measured. The candidate diagnostic removes one direction, protects one control, and fails its nonlinear synthetic gate. These facts rule out claims about erasure, prevalence, or Hessian geometry in general.
 
-The original archives still lack Phase-2 per-example predictions, edited representations for fresh-decoder training, failed layer-evaluator accuracies, and Hessian eigenvectors. Orientation and fresh-decoder recovery were tested in one prespecified model--layer--task cell in the revision follow-up; the original archive and the remaining cells still lack these endpoints. The one-cell result is a falsification check, not evidence of erasure elsewhere.
+% BEGIN POST-RUN CONSTRUCT-SCOPE UPDATE
+The original archives still lack Phase-2 per-example predictions, edited representations for fresh-decoder training, failed layer-evaluator accuracies, and Hessian eigenvectors. New extension artifacts support the disclosed pilot and prospective middle-layer construct panel, but do not repair the historical archive or turn task-decoder recovery into evidence about downstream model behavior. The finite decoder battery remains a falsification check and cannot establish erasure.
+% END POST-RUN CONSTRUCT-SCOPE UPDATE
 
 Invalid scores can support false claims about concept removal, bias mitigation, or safety. Here, the same AlterRep edit appears nearly complete under its generating decoder and substantially weaker under a split evaluator, invalidating the score as a probe-quality target. Similar claims should first trace the scored object, separate editing from evaluation, test inversion and redecodability, and align inference with shared data.
+
+The positive impact is narrower but practical: scored-object audits can prevent linguistic probing results from being overstated as evidence about model use, removal, or safety. The main risk is that readers treat evaluator separation or threshold passing as a universal certificate of erasure. We mitigate that risk by treating the decoder battery as a falsification test, requiring independent evaluators and construct checks, and making no claim about downstream model behavior.
 
 \clearpage
 \bibliographystyle{plainnat}
@@ -252,13 +258,54 @@ PGD      & 1.00 & 1.00 & 0.69 & 0.83 & 0.0 \\
 
 The post-registration Phase-2 re-test is descriptive because the synthetic battery rejects $\Dcand$. Across 168 architecture medians in 56 cells, $\rho(A,\Dcand)=-0.042$ with archived permutation $p=.59$. The registered cell-bootstrap 95\% interval is $[-0.228,0.153]$. Post-hoc intervals are $[-0.296,0.268]$ under a 14-block model--task bootstrap, $[-0.245,0.109]$ under a six-model bootstrap, and $[-0.346,0.278]$ under a model/task/layer hierarchical bootstrap. Within-cell architecture ranks give $\rho=-0.143$, interval $[-0.320,0.041]$. The architecture hit rate is $0.375$ (21/56), interval $[0.241,0.509]$.
 
+% BEGIN POST-RUN CONSTRUCT-PILOT-APPENDIX UPDATE
+\section{Disclosed pilot compatibility checks}
+\label{app:pilot-compatibility}
+In the disclosed \ConstructCell{} pilot, orientation calibration changed median fixed-evaluator damage from \ConstructRawMedian{} to \ConstructOrientedMedian{} across \ConstructCandidates{} candidate edits. Fresh linear decoders reached median final-test accuracy \ConstructFreshLinear{} on edited states versus their \ConstructFreshLinearBaseline{} unedited baseline; fresh MLP decoders reached \ConstructFreshMLP{} versus \ConstructFreshMLPBaseline{}. These endpoints were inspected before the prospective panel was registered, receive no confirmatory p-value or decision, and do not establish erasure. Orientation was selected only on the disjoint calibration split and frozen for final-test evaluation.
+
+\begin{figure}[ht]
+  \centering
+  \includegraphics[width=0.9\linewidth]{figures/fig_orientation_redecodability.pdf}
+  \caption{Descriptive pilot compatibility endpoints for the 60 candidate-conditioned edits in Qwen2.5-1.5B/SST-2/layer 14. Panels align raw fixed-evaluator damage, calibration-frozen orientation damage, and fresh linear/MLP target-label accuracy.}
+  \label{fig:orientation-redecodability}
+\end{figure}
+% END POST-RUN CONSTRUCT-PILOT-APPENDIX UPDATE
+
 \section{Reproducibility and assets}
 The anonymous code supplement is available at
 \href{https://anonymous.4open.science/r/Neurips-Code-Supplement-DE78}
 {this anonymous repository}.
-It contains the benchmark source, analysis scripts, tests, configuration files, registrations, Phase~1 and Phase~2 rows, matched-versus-split outputs, synthetic outputs, and the cell inclusion matrix. The supplement also documents artifacts that were not persisted: Phase~2 per-example predictions, edited representations needed for fresh-decoder analysis, failed layer-evaluator accuracies, and Hessian eigenvectors. These omissions prevent retrospective orientation, redecodability, threshold, and basis-invariant subspace analyses. The repository provides environment-setup instructions and executable commands, although the full original result-generation environment was not preserved. The experiments use publicly available pretrained models and published NLP datasets cited in the main paper; model weights are not redistributed.
+It contains source code, tests, locked specifications, registrations, environment-reconstruction manifests, and exact commands that regenerate the analyses, figures, and manuscript. Generated rows, checkpoints, figures, caches, and manuscript builds are intentionally excluded from Git; each run writes immutable, hash-verified artifacts to a timestamped local directory. The code is released under the MIT License. Model weights are not redistributed.
+
+The submission run used one NVIDIA GeForce RTX~5070 GPU (12,227 MiB), an Intel Core i9-14900K CPU (32 logical cores), and 47.8 GiB RAM on Windows 11, with Python 3.13.5, PyTorch 2.12.0.dev20260408+cu128 (CUDA 12.8), and Transformers 5.7.0. Transformer extraction and the registered candidate MLP/Jacobian operations use the GPU; probes, edits, fresh decoders, bootstraps, and exact tests run on CPU. The run manifest records stage-level wall time, peak process memory, device selection, and storage use.
+
+\begin{table}[ht]
+\centering
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{p{0.24\linewidth}p{0.28\linewidth}p{0.38\linewidth}}
+\toprule
+Asset & Revision & License or terms \\
+\midrule
+Pythia-160M & \texttt{50f5173d9} & Apache-2.0; \url{https://huggingface.co/EleutherAI/pythia-160m} \\
+GPT-2 & \texttt{607a30d78} & MIT; \url{https://huggingface.co/openai-community/gpt2} \\
+BERT base uncased & \texttt{86b5e0934} & Apache-2.0; \url{https://huggingface.co/google-bert/bert-base-uncased} \\
+Qwen2.5-1.5B & \texttt{8faed761d} & Apache-2.0; \url{https://huggingface.co/Qwen/Qwen2.5-1.5B} \\
+Gemma-2-2B & \texttt{c5ebcd40d} & Gemma Terms; gated access; \url{https://huggingface.co/google/gemma-2-2b} \\
+Llama-3.2-3B & \texttt{13afe5124} & Llama 3.2 Community License and acceptable-use policy; gated access; \url{https://huggingface.co/meta-llama/Llama-3.2-3B} \\
+SST-2 & \texttt{8d51e7e48} & Hugging Face card reports license unspecified; \url{https://huggingface.co/datasets/stanfordnlp/sst2} \\
+SVA dependencies & repository snapshot & MIT; \url{https://github.com/TalLinzen/rnn_agreement} \\
+WinoGender schemas & repository snapshot & MIT; \url{https://github.com/rudinger/winogender-schemas} \\
+\bottomrule
+\end{tabular}
+\caption{External assets, exact cached revisions where applicable, and governing terms. Dataset and model creators are cited in the main text.}
+\label{tab:assets}
+\end{table}
 
 \paragraph{Tool assistance.}
 Large-language-model tools supported code implementation but were not part of the evaluated method. The authors reviewed the code, recomputed reported analyses, and retain responsibility for the submission.
+
+\clearpage
+\input{neurips_2026_checklist.tex}
 
 \end{document}

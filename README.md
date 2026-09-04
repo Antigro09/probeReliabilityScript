@@ -77,9 +77,65 @@ complete only after every rendered manuscript page and generated figure has
 been visually inspected and that review is recorded as `visually_inspected`;
 an exit code or source-level test result alone is not the completion gate.
 
+### Reviewer caveat-hardening extension
+
+The extension adds the locked denominator-floor sensitivity analysis and the
+prospective 11-cell construct panel. Run it from the repository root after the
+base reviewer pipeline has completed and its run has passed finalization.
+
+```powershell
+# Check the exact workload without computing endpoints.
+.\.venv\Scripts\python.exe .\scripts\run_reviewer_caveat_extension.py all `
+  --config .\revision_caveat_extension_spec.yaml `
+  --base-config .\revision_experiment_spec.yaml `
+  --dry-run --device cuda
+
+# Registered submission run. The extension spec names the immutable base run.
+.\.venv\Scripts\python.exe .\scripts\run_reviewer_caveat_extension.py all `
+  --config .\revision_caveat_extension_spec.yaml `
+  --base-config .\revision_experiment_spec.yaml `
+  --output-root .\results\reviewer_caveat_extension_2026_08 `
+  --device cuda
+
+# Resume the newest compatible run after interruption.
+.\.venv\Scripts\python.exe .\scripts\run_reviewer_caveat_extension.py all `
+  --config .\revision_caveat_extension_spec.yaml `
+  --base-config .\revision_experiment_spec.yaml `
+  --output-root .\results\reviewer_caveat_extension_2026_08 `
+  --device cuda --resume
+```
+
+For a clean, code-only reproduction, first regenerate and finalize the base
+reviewer run with the command above, then supply that timestamped directory
+explicitly. The opt-in flag preserves the registered default while allowing a
+new base run only after the same schema, configuration hash, finalization, and
+artifact-integrity checks pass.
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\run_reviewer_caveat_extension.py all `
+  --config .\revision_caveat_extension_spec.yaml `
+  --base-config .\revision_experiment_spec.yaml `
+  --base-run .\results\reviewer_revision_2026_08\<run-id> `
+  --allow-reproduced-base `
+  --output-root .\results\reviewer_caveat_extension_2026_08 `
+  --device cuda
+```
+
+Preflight validates the base artifacts, all model/task/layer cache pins, and a
+storage budget equal to the projected construct artifacts plus an 8 GiB free
+reserve. The stages are `preflight`, `robustness`, `construct-panel`, `analyze`,
+`package-artifacts`, `figures`, and `patch-paper`. A successful run produces
+hash-verified row tables, inference summaries, environment locks, figures, and
+the compiled manuscript beneath one immutable timestamped output directory.
+Generated rows, checkpoints, caches, figures, and manuscript builds are local
+artifacts and are deliberately not committed to Git. Render and inspect every
+page of the final PDF and each generated figure before submission.
+
 ### Data
 
-- SVA: place numpred.{train,val,test} in data/.
+- SVA: place `numpred.{train,val,test}` from the MIT-licensed
+  [Linzen agreement repository](https://github.com/TalLinzen/rnn_agreement)
+  in `data/`.
 - Gender agreement: data/gender.tsv (TAB-separated:
   sentence  FEM|MASC  FEM_SKEW|MASC_SKEW), REQUIRED. The checked-in file
   is the regenerated v2 dataset: 188 examples, full-sentence style,

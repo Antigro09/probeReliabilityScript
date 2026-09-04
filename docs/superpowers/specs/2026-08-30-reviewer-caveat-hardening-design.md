@@ -61,7 +61,7 @@ The code exports a sanitized current-environment lock containing:
 - PyTorch build/version and selected deterministic device protocol; and
 - hashes of the extension spec and generating commit.
 
-The exporter rejects absolute local paths, editable installs, credentials, and direct URLs rather than leaking machine-specific state. A human-readable lock file contains `name==version` entries where reconstructible; nonstandard builds such as the recorded development PyTorch build remain explicitly documented instead of being presented as generally installable.
+The exporter rejects absolute local paths, editable installs, and credentials. For a non-editable distribution carrying direct-source metadata, it records only a path-free `direct_url_redacted` marker and excludes that distribution from reconstructible lock entries; the URL itself is never emitted. A human-readable lock file contains `name==version` entries only where reconstructible, while direct-source packages and nonstandard builds such as the recorded development PyTorch build remain explicitly documented instead of being presented as generally installable.
 
 This preserves the current extension environment. It does not claim to reconstruct the historically lost original environment.
 
@@ -85,7 +85,7 @@ Generated figures include:
 - the existing epsilon sweep unchanged except for any regenerated styling consistency; and
 - a construct panel showing per-cell recovery, marginal one-sided bounds, control retention, and explicit pilot/confirmatory labeling.
 
-The compiled paper must still satisfy the five-main-page workshop limit, anonymous metadata/text checks, citation/reference checks, overfull-box gate, 300-DPI figure gate, and page-by-page visual inspection.
+The compiled paper must satisfy the LP4FM nine-main-page workshop limit, anonymous metadata/text checks, citation/reference checks, overfull-box gate, 300-DPI figure gate, and page-by-page visual inspection.
 
 ## Architecture and Data Flow
 

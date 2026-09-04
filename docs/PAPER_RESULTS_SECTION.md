@@ -106,8 +106,8 @@ architectures but carries no signal about causal reliability.
 
 Before submission, the anonymized 4open.science mirror must be updated to v2 and
 scrubbed of deanonymizing metadata. Checklist:
-- Repo/author strings: `Antigro09`, `antigro09`, `anthonyj.cavero@gmail.com`,
-  local paths `C:\Users\antho\...` (appear in `data/gender.provenance.json` and
+- Repo/author strings: contributor usernames, contributor email addresses,
+  and local home-directory paths (appear in provenance records and
   cache/provenance sidecars — regenerate or scrub).
 - Git history/author identity and any commit co-author trailers.
 - The mirror must point only at the anonymized copy; the paper must not link the

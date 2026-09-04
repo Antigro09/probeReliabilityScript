@@ -1,8 +1,8 @@
 {
   "generator": "scripts/generate_gender_data.py",
   "git_commit": "1f68c215518a14f7f40f4d1654e7a24d39925403",
-  "templates": "C:\\Users\\antho\\Documents\\Projects\\AI Research\\probeReliabilityScript\\data\\winogender\\templates.tsv",
-  "stats": "C:\\Users\\antho\\Documents\\Projects\\AI Research\\probeReliabilityScript\\data\\winogender\\occupations-stats.tsv",
+  "templates": "data/winogender/templates.tsv",
+  "stats": "data/winogender/occupations-stats.tsv",
   "stat_source": "bls",
   "style": "full-sentence",
   "referent": "occupation",

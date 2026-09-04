@@ -89,7 +89,7 @@ def test_all_supported_artifact_types_are_written_atomically(tmp_path: Path) -> 
 
 def test_run_context_is_exclusive_immutable_and_sanitizes_manifest_paths(tmp_path: Path) -> None:
     fixed_time = datetime(2026, 8, 29, 12, 34, 56, tzinfo=timezone.utc)
-    secret_path = tmp_path / "Users" / "antho" / "private" / "cache.pt"
+    secret_path = tmp_path / "Users" / "local-user" / "private" / "cache.pt"
 
     with RunContext.create(
         output_root=tmp_path / "runs",
@@ -106,7 +106,7 @@ def test_run_context_is_exclusive_immutable_and_sanitizes_manifest_paths(tmp_pat
         manifest = json.loads(manifest_text)
         assert run.manifest_path.name == "run_manifest.json"
         assert str(tmp_path) not in manifest_text
-        assert "antho" not in manifest_text
+        assert "local-user" not in manifest_text
         assert manifest["source_cache"] == "<ABS_PATH>/cache.pt"
         assert manifest["nested"]["home"] == "<ABS_PATH>/private"
 

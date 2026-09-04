@@ -815,7 +815,7 @@ Expected: official rule evidence is linked and paraphrased without excessive quo
   --resume
 ```
 
-Expected: latexmk exits zero; PDF author metadata is anonymous; the five-main-page workshop limit is satisfied with references starting afterward; no undefined citations/references; overfull boxes at most 3 pt; required PDF/300-DPI PNG figures exist.
+Expected: latexmk exits zero; PDF author metadata is anonymous; the LP4FM nine-main-page workshop limit is satisfied with references starting afterward; no undefined citations/references; overfull boxes at most 3 pt; required PDF/300-DPI PNG figures exist.
 
 - [ ] **Step 3: Inspect every page and generated figure**
 
@@ -848,7 +848,7 @@ git branch local/reviewer-revision-with-results HEAD
 git worktree add ..\probeReliabilityScript-code-only origin/main
 ```
 
-Resolve and verify both worktree paths remain inside `C:\Users\antho\Documents\Projects\AI Research` before later cleanup.
+Resolve and verify both worktree paths remain inside the intended project parent before later cleanup.
 
 - [ ] **Step 2: Rebuild implementation history without result commits**
 
