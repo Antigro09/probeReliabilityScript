@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from src.probes import ProbeTrainConfig
+from src.reviewer_revision import runner as runner_module
 from src.reviewer_revision.artifacts import RunContext, sha256_file
 from src.reviewer_revision.config import load_revision_config
 from src.reviewer_revision.experiments import (
@@ -19,6 +20,7 @@ from src.reviewer_revision.experiments import (
     score_conditions_for_edit,
     train_attacker_evaluator_pair,
 )
+from src.reviewer_revision.extension_config import ConstructCell
 from src.reviewer_revision.runner import (
     MANUSCRIPT_TEMPLATE_PATH,
     MANUSCRIPT_TEMPLATE_TEXT_SHA256,
@@ -45,6 +47,46 @@ from src.reviewer_revision.runner import (
     resolve_resume_directory,
     save_pair_checkpoint,
 )
+from src.ws5_repaired import EvaluatorQualityError
+
+
+def test_construct_cell_quality_failure_is_materialized_as_nonestimable(
+    monkeypatch, tmp_path
+):
+    config = load_revision_config("revision_experiment_spec.yaml")
+    context = RunContext.create(
+        output_root=tmp_path,
+        config_hash=config.config_hash,
+        git_commit="a" * 40,
+        timestamp=datetime(2026, 9, 3, tzinfo=timezone.utc),
+    )
+    cell = ConstructCell("bert", "google-bert/bert-base-uncased", "sva", 6)
+
+    def raise_blind_evaluator(*args, **kwargs):
+        raise EvaluatorQualityError("certifier below locked quality floor")
+
+    monkeypatch.setattr(
+        runner_module, "_run_construct_cell", raise_blind_evaluator
+    )
+
+    summary = runner_module.run_construct_cell(
+        context,
+        config,
+        cell=cell,
+        device=torch.device("cpu"),
+    )
+
+    assert summary["status"] == "nonestimable"
+    assert summary["failure_stage"] == "evaluator_quality_gate"
+    group_rows = pd.read_parquet(
+        context.run_dir
+        / "construct"
+        / "cells"
+        / cell.slug
+        / "construct_group_rows.parquet"
+    )
+    assert group_rows["status"].tolist() == ["nonestimable"]
+    context.close()
 
 
 def test_locked_manuscript_template_matches_declared_text_hash():

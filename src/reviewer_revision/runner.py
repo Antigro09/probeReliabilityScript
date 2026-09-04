@@ -35,7 +35,7 @@ from src.extraction import (
 from src.probes import LinearProbe, MKAProbe, MLPProbe, ProbeTrainConfig, train_probe
 from src.repro import set_seed
 from src.tasks import Example
-from src.ws5_repaired import train_independent_evaluators
+from src.ws5_repaired import EvaluatorQualityError, train_independent_evaluators
 
 from .analysis import (
     materialize_rows,
@@ -5157,6 +5157,44 @@ def run_construct_cell(
             device=device,
             legacy_layout=False,
         )
+    except EvaluatorQualityError as error:
+        failure_reason = f"{type(error).__name__}: {error}"
+        frame = materialize_construct_cell_status(
+            context,
+            config,
+            cell=cell,
+            status="nonestimable",
+            failure_stage="evaluator_quality_gate",
+            failure_reason=failure_reason,
+        )
+        layout = _construct_layout(context.run_dir, cell)
+        if layout.group_rows_parquet is None:
+            raise RuntimeError("construct cell group-row path is unavailable")
+        summary = {
+            "status": "nonestimable",
+            "cell": layout.summary_cell,
+            "failure_stage": "evaluator_quality_gate",
+            "failure_reason": failure_reason,
+            "generating_git_commit": _current_commit(),
+            "construct_group_rows_ref": _relative(
+                layout.group_rows_parquet, context.run_dir
+            ),
+            "construct_group_rows_sha256": sha256_file(
+                layout.group_rows_parquet
+            ),
+            "construct_group_row_count": len(frame),
+        }
+        _write_immutable_json(layout.summary_path, summary)
+        context.update_manifest(
+            {
+                layout.manifest_key: {
+                    "status": "nonestimable",
+                    "failure_stage": "evaluator_quality_gate",
+                    "failure_reason": failure_reason,
+                }
+            }
+        )
+        return summary
     except Exception as error:
         materialize_construct_cell_status(
             context,

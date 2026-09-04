@@ -834,6 +834,18 @@ def _cell_status_frame(cell: ConstructCell, error: BaseException) -> pd.DataFram
     )
 
 
+def _persist_construct_failure_frame(
+    failure_root: Path, failure_frame: pd.DataFrame
+) -> None:
+    atomic_write_parquet(
+        failure_root / "construct_group_rows.failed.parquet", failure_frame
+    )
+    atomic_write_csv(
+        failure_root / "construct_group_rows.failed.csv",
+        failure_frame.to_dict(orient="records"),
+    )
+
+
 def _validate_completed_cell_shard(
     context: RunContext,
     cell: ConstructCell,
@@ -842,21 +854,33 @@ def _validate_completed_cell_shard(
         _CONSTRUCT_CELL_EXPERIMENT,
         (cell.model_key, cell.task, cell.layer),
     )
-    if payload.get("status") != "ok" or payload.get("cell_slug") != cell.slug:
+    status = payload.get("status")
+    if status not in {"ok", "nonestimable"} or payload.get("cell_slug") != cell.slug:
         raise RuntimeError(f"completed construct cell shard is invalid: {cell.slug}")
-    for field in (
-        "compatibility_rows",
-        "compatibility_csv",
-        "cell_summary",
-        "group_rows",
-        "group_rows_csv",
-    ):
+    fields = (
+        (
+            "compatibility_rows",
+            "compatibility_csv",
+            "cell_summary",
+            "group_rows",
+            "group_rows_csv",
+        )
+        if status == "ok"
+        else ("cell_summary", "group_rows", "group_rows_csv")
+    )
+    for field in fields:
         artifact = payload.get(field)
         if not isinstance(artifact, Mapping):
             raise TypeError(f"construct cell shard lacks {field}: {cell.slug}")
         path = _run_path(context, artifact.get("path"))
         if not path.is_file() or sha256_file(path) != artifact.get("sha256"):
             raise RuntimeError(f"construct cell artifact hash mismatch: {cell.slug}/{field}")
+    if status == "nonestimable":
+        rows = _load_generic_group_rows(context.run_dir, cell)
+        if len(rows) != 1 or rows.iloc[0].get("status") != "nonestimable":
+            raise RuntimeError(
+                f"nonestimable construct cell must contain one status row: {cell.slug}"
+            )
 
 
 def run_construct_panel(
@@ -889,55 +913,71 @@ def run_construct_panel(
                 cell=cell,
                 device=device,
             )
-            if summary.get("status") != "ok":
+            worker_status = summary.get("status")
+            if worker_status not in {"ok", "nonestimable"}:
                 raise RuntimeError(
-                    f"construct worker returned status {summary.get('status')!r}"
+                    f"construct worker returned status {worker_status!r}"
                 )
             cell_root = context.run_dir / "construct" / "cells" / cell.slug
             compatibility_path = cell_root / "construct_check_rows.parquet"
             compatibility_csv = cell_root / "construct_check_rows.csv"
             cell_summary = cell_root / "construct_check_summary.json"
             group_path, group_csv = _cell_group_paths(context.run_dir, cell)
-            compatibility = pd.read_parquet(compatibility_path)
-            if len(compatibility) != 390:
-                raise RuntimeError(
-                    f"construct cell {cell.slug} requires exactly 390 compatibility rows"
+            group_rows = _load_generic_group_rows(context.run_dir, cell)
+            payload: dict[str, Any] = {
+                "status": worker_status,
+                "cell_slug": cell.slug,
+                "cell_summary": {
+                    "path": _relative(cell_summary, context.run_dir),
+                    "sha256": sha256_file(cell_summary),
+                },
+                "group_rows": {
+                    "path": _relative(group_path, context.run_dir),
+                    "sha256": sha256_file(group_path),
+                },
+                "group_rows_csv": {
+                    "path": _relative(group_csv, context.run_dir),
+                    "sha256": sha256_file(group_csv),
+                },
+            }
+            if worker_status == "ok":
+                compatibility = pd.read_parquet(compatibility_path)
+                if len(compatibility) != 390:
+                    raise RuntimeError(
+                        f"construct cell {cell.slug} requires exactly 390 compatibility rows"
+                    )
+                payload.update(
+                    {
+                        "compatibility_rows": {
+                            "path": _relative(compatibility_path, context.run_dir),
+                            "sha256": sha256_file(compatibility_path),
+                            "rows": len(compatibility),
+                        },
+                        "compatibility_csv": {
+                            "path": _relative(compatibility_csv, context.run_dir),
+                            "sha256": sha256_file(compatibility_csv),
+                        },
+                    }
                 )
-            _load_generic_group_rows(context.run_dir, cell)
+            elif len(group_rows) != 1 or group_rows.iloc[0].get("status") != "nonestimable":
+                raise RuntimeError(
+                    f"nonestimable construct cell must contain one status row: {cell.slug}"
+                )
+            payload.update(
+                {
+                    "failure_stage": summary.get("failure_stage"),
+                    "failure_reason": summary.get("failure_reason"),
+                }
+            )
             context.write_json_shard(
                 _CONSTRUCT_CELL_EXPERIMENT,
                 key,
-                {
-                    "status": "ok",
-                    "cell_slug": cell.slug,
-                    "compatibility_rows": {
-                        "path": _relative(compatibility_path, context.run_dir),
-                        "sha256": sha256_file(compatibility_path),
-                        "rows": len(compatibility),
-                    },
-                    "compatibility_csv": {
-                        "path": _relative(compatibility_csv, context.run_dir),
-                        "sha256": sha256_file(compatibility_csv),
-                    },
-                    "cell_summary": {
-                        "path": _relative(cell_summary, context.run_dir),
-                        "sha256": sha256_file(cell_summary),
-                    },
-                    "group_rows": {
-                        "path": _relative(group_path, context.run_dir),
-                        "sha256": sha256_file(group_path),
-                    },
-                    "group_rows_csv": {
-                        "path": _relative(group_csv, context.run_dir),
-                        "sha256": sha256_file(group_csv),
-                    },
-                },
+                payload,
             )
         except Exception as error:  # noqa: BLE001 - persist an explicit cell failure
             failure_frame = _cell_status_frame(cell, error)
             failure_root = context.run_dir / "construct" / "cells" / cell.slug
-            atomic_write_parquet(failure_root / "construct_group_rows.failed.parquet", failure_frame)
-            atomic_write_csv(failure_root / "construct_group_rows.failed.csv", failure_frame)
+            _persist_construct_failure_frame(failure_root, failure_frame)
             context.write_json_shard(
                 _CONSTRUCT_CELL_EXPERIMENT,
                 key,

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 from src.reviewer_revision import extension_runner
@@ -452,6 +453,60 @@ def test_completed_construct_cell_requires_every_materialized_artifact_hash(
     with pytest.raises(TypeError, match="lacks compatibility_csv"):
         extension_runner._validate_completed_cell_shard(context, cell)
     context.close()
+
+
+def test_completed_nonestimable_construct_cell_requires_only_status_artifacts(
+    tmp_path: Path, extension_config
+) -> None:
+    context = _context(tmp_path)
+    cell = extension_config.confirmatory_cells[0]
+    root = context.run_dir / "construct" / "cells" / cell.slug
+    root.mkdir(parents=True)
+    groups = root / "construct_group_rows.parquet"
+    group_csv = root / "construct_group_rows.csv"
+    summary = root / "construct_check_summary.json"
+    pd.DataFrame([{"status": "nonestimable"}]).to_parquet(groups, index=False)
+    group_csv.write_text("status\nnonestimable\n", encoding="utf-8")
+    summary.write_text('{"status":"nonestimable"}\n', encoding="utf-8")
+    context.write_json_shard(
+        "construct-panel-cells",
+        (cell.model_key, cell.task, cell.layer),
+        {
+            "status": "nonestimable",
+            "cell_slug": cell.slug,
+            "group_rows": {
+                "path": str(groups.relative_to(context.run_dir)),
+                "sha256": extension_runner.sha256_file(groups),
+            },
+            "group_rows_csv": {
+                "path": str(group_csv.relative_to(context.run_dir)),
+                "sha256": extension_runner.sha256_file(group_csv),
+            },
+            "cell_summary": {
+                "path": str(summary.relative_to(context.run_dir)),
+                "sha256": extension_runner.sha256_file(summary),
+            },
+        },
+    )
+
+    extension_runner._validate_completed_cell_shard(context, cell)
+    context.close()
+
+
+def test_construct_failure_frame_is_persisted_to_both_table_formats(
+    tmp_path: Path, extension_config
+) -> None:
+    cell = extension_config.confirmatory_cells[0]
+    frame = extension_runner._cell_status_frame(cell, RuntimeError("boom"))
+
+    extension_runner._persist_construct_failure_frame(tmp_path, frame)
+
+    csv_rows = pd.read_csv(tmp_path / "construct_group_rows.failed.csv")
+    parquet_rows = pd.read_parquet(
+        tmp_path / "construct_group_rows.failed.parquet"
+    )
+    assert csv_rows.loc[0, "status"] == "failed"
+    assert parquet_rows.loc[0, "failure_reason"] == "RuntimeError: boom"
 
 
 def test_workshop_pdf_accepts_exact_fifty_megabyte_limit(
