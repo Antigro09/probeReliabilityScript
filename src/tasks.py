@@ -17,6 +17,7 @@ All tasks produce a list[Example] where each Example has:
 
 from __future__ import annotations
 
+import json
 import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -40,6 +41,11 @@ class Example:
     sentence: str
     zc: int
     ze: int
+    # Optional grouping/provenance fields used by the post-registration
+    # robustness split. Existing extraction and cache code deliberately only
+    # depends on sentence/zc/ze, so old data and schema-v2 runs are unchanged.
+    group: str | None = None
+    metadata: dict | None = None
 
     def to_dict(self) -> dict:
         return {"sentence": self.sentence, "zc": self.zc, "ze": self.ze}
@@ -209,6 +215,7 @@ class GenderTask(Task):
     def _load_from_files(self, paths):
         examples: list[Example] = []
         for path in paths:
+            metadata_by_sentence = self._load_metadata_sidecar(path)
             with path.open("r", encoding="utf-8") as f:
                 for lineno, line in enumerate(f, start=1):
                     if not line.strip():
@@ -241,8 +248,43 @@ class GenderTask(Task):
                         )
                     zc = 1 if pron_lab == "FEM" else 0
                     ze = 1 if prof_lab == "FEM_SKEW" else 0
-                    examples.append(Example(sentence=sent, zc=zc, ze=ze))
+                    metadata = metadata_by_sentence.get(sent)
+                    examples.append(Example(
+                        sentence=sent,
+                        zc=zc,
+                        ze=ze,
+                        group=(metadata.get("minimal_pair_id") if metadata else None),
+                        metadata=metadata,
+                    ))
         return examples
+
+    @staticmethod
+    def _load_metadata_sidecar(path: Path) -> dict[str, dict]:
+        """Load optional group metadata produced by generate_gender_data.
+
+        The three-column TSV remains the canonical task file. The JSONL
+        sidecar is additive and is used only by schema-v3 group-held-out
+        analyses; its absence therefore preserves all prior behavior.
+        """
+        sidecar = path.with_suffix(".metadata.jsonl")
+        if not sidecar.exists():
+            return {}
+        out: dict[str, dict] = {}
+        with sidecar.open(encoding="utf-8") as fh:
+            for lineno, line in enumerate(fh, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{sidecar}:{lineno}: invalid JSON: {exc}") from exc
+                sentence = row.get("sentence")
+                if not sentence:
+                    raise ValueError(f"{sidecar}:{lineno}: missing sentence")
+                if sentence in out:
+                    raise ValueError(f"{sidecar}:{lineno}: duplicate sentence metadata")
+                out[sentence] = row
+        return out
 
     @staticmethod
     def _validate(examples: list[Example]) -> None:

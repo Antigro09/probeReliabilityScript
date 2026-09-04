@@ -88,3 +88,14 @@ def test_nonlinear_family_subspace_truth():
     tr, ev, truth = make_planted_reps(cfg)
     assert truth["concept_subspace"].shape == (24, 2)
     assert tr["X"].shape == (200, 24)
+
+
+def test_nonlinear_correlated_shortcut_condition_is_not_ignored():
+    cfg = SyntheticConfig(
+        D=32, N=200, family="nonlinear", vs_vc_corr=0.3, seed=12
+    )
+    _, _, truth = make_planted_reps(cfg)
+    corr_a = float(torch.dot(truth["v_s"], truth["v_a"]))
+    corr_b = float(torch.dot(truth["v_s"], truth["v_b"]))
+    assert corr_a == pytest.approx(0.3, abs=1e-5)
+    assert corr_b == pytest.approx(0.0, abs=1e-5)

@@ -195,6 +195,9 @@ def run_replicate(family, alpha, replicate, args, device, train_cfg, probe_cfg, 
         )
         row = {
             "schema_version": SCHEMA_VERSION, "family": family, "alpha_train": alpha,
+            "vs_vc_corr": float(args.vs_vc_corr),
+            "ambient_dim": int(args.D), "n_per_environment": int(args.N),
+            "requested_rank": int(args.rank),
             "replicate": replicate, "arch": arch, "seed": seed,
             "control": ("shuffled" if shuffled else "random" if random_dir else "none"),
             "accuracy_eval": acc, "accuracy_train": acc_train,

@@ -51,6 +51,7 @@ Van Durme, "Gender Bias in Coreference Resolution", NAACL 2018.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -211,6 +212,7 @@ def load_templates(path: Path) -> list[dict]:
             fail(f"{path}:{i}: sentence has no pronoun placeholder: "
                  f"{sentence!r}")
         templates.append({
+            "template_id": f"row-{i}",
             "occupation": occupation.lower(),
             "participant": participant.lower(),
             "referent": referent,
@@ -290,7 +292,21 @@ def main():
                 sent = instantiate(tpl, gender, use_someone)
                 if args.style == "post-pronoun":
                     sent = truncate_post_pronoun(sent, gender)
-                kept.append((sent, gender, skew))
+                participant_variant = "someone" if use_someone else "named"
+                pair_key = f"{tpl['template_id']}|{participant_variant}|{args.style}"
+                kept.append({
+                    "sentence": sent,
+                    "gender": gender,
+                    "skew": skew,
+                    "occupation": tpl["occupation"],
+                    "template_id": tpl["template_id"],
+                    "participant_variant": participant_variant,
+                    "minimal_pair_id": hashlib.sha256(pair_key.encode("utf-8")).hexdigest()[:20],
+                    "pronoun_position": next(
+                        i for i, tok in enumerate(sent.split())
+                        if tok.strip(".,;:!?\"'").lower() in PRONOUN_TOKENS[gender]
+                    ),
+                })
 
     print(f"[filter] dropped {dropped_referent} templates by referent, "
           f"{len(dropped_neutral)} NEUTRAL occupations: "
@@ -301,19 +317,20 @@ def main():
         fail(f"only {len(kept)} examples generated (< {args.min_examples})")
 
     zc_by_sentence: dict[str, set] = defaultdict(set)
-    for sent, gender, _ in kept:
-        zc_by_sentence[sent].add(gender)
+    for row in kept:
+        zc_by_sentence[row["sentence"]].add(row["gender"])
     conflicting = [s for s, g in zc_by_sentence.items() if len(g) > 1]
     if conflicting:
         fail(f"{len(conflicting)} sentences carry BOTH gender labels — this "
              f"is the v1 truncation bug. First offender: {conflicting[0]!r}")
 
-    for sent, gender, _ in kept:
+    for row in kept:
+        sent, gender = row["sentence"], row["gender"]
         toks = {t.strip(".,;:!?\"'").lower() for t in sent.split()}
         if not toks & PRONOUN_TOKENS[gender]:
             fail(f"sentence lacks its {gender} pronoun: {sent!r}")
 
-    counts = Counter((g, s) for _, g, s in kept)
+    counts = Counter((row["gender"], row["skew"]) for row in kept)
     print("[counts] per (gender, skew) cell:")
     for key in sorted(counts):
         print(f"    {key}: {counts[key]}")
@@ -324,10 +341,16 @@ def main():
     # ---- Write output + provenance sidecar ----
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as f:
-        for sent, gender, skew in kept:
+        for row in kept:
+            sent, gender, skew = row["sentence"], row["gender"], row["skew"]
             if "\t" in sent:
                 fail(f"tab inside sentence would corrupt the TSV: {sent!r}")
             f.write(f"{sent}\t{gender}\t{skew}\n")
+
+    metadata_sidecar = args.out.with_suffix(".metadata.jsonl")
+    with metadata_sidecar.open("w", encoding="utf-8") as f:
+        for row in kept:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
 
     try:
         commit = subprocess.run(
@@ -349,11 +372,13 @@ def main():
         "masc_threshold": args.masc_threshold,
         "dropped_neutral_occupations": sorted(dropped_neutral),
         "n_examples": len(kept),
+        "metadata_sidecar": str(metadata_sidecar),
         "cell_counts": {f"{g}/{s}": c for (g, s), c in sorted(counts.items())},
         "source_attribution": "Rudinger et al., NAACL 2018 (winogender-schemas)",
     }, indent=2))
 
     print(f"[write] {len(kept)} examples -> {args.out}")
+    print(f"[write] group metadata -> {metadata_sidecar}")
     print(f"[write] provenance -> {sidecar}")
 
 

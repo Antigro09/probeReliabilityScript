@@ -1,5 +1,13 @@
 # WS0–WS3: experimenter decisions pending sign-off
 
+> **SUPERSEDED by `PREREGISTRATION_v2.md`.** Every decision below has since
+> been locked there; this doc is kept as a historical record and some values
+> in it are stale. In particular: `mka.lambda_reg` is locked at **0.5**
+> (§3.3, and all `configs/*.yaml` carry 0.5), not the provisional 0.1 in
+> item 1; and `data/gender.tsv` has been **regenerated** (188 examples,
+> full-sentence style, commit `1f68c21` — see `data/gender.provenance.json`
+> and §3.4), so item 4's ACTION about the broken v1 artifact is done.
+
 The WS0–WS3 code landed with provisional defaults everywhere a value is an
 experimenter call. Each item below must be confirmed or overridden, then
 locked in `PREREGISTRATION_v2.md` **before** the v2 benchmark launches.

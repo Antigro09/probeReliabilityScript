@@ -168,6 +168,14 @@ def make_planted_reps(cfg: SyntheticConfig) -> tuple[dict, dict, dict]:
     elif cfg.family == "nonlinear":
         base = _orthonormal(cfg.D, 4, g)
         v_a, v_b, v_e, v_s = base[0], base[1], base[2], base[3]
+        if cfg.vs_vc_corr != 0.0:
+            # For the two-dimensional XOR concept, correlate the shortcut with
+            # one planted concept axis while keeping the other axis orthogonal.
+            # The concept ground truth remains span(v_a, v_b); this implements
+            # the registered non-orthogonal held-out condition rather than
+            # silently ignoring vs_vc_corr for the nonlinear family.
+            rho = cfg.vs_vc_corr
+            v_s = _unit(rho * v_a + math.sqrt(max(0.0, 1 - rho ** 2)) * v_s)
         dirs = {"v_a": v_a, "v_b": v_b, "v_e": v_e, "v_s": v_s}
         V = torch.stack([v_a, v_b], dim=1)   # (D, 2) orthonormal columns
         truth = {

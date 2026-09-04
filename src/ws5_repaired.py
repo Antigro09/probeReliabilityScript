@@ -60,6 +60,7 @@ EVAL_MIN_ACC = 0.60            # D10: out-of-sample evaluator floor; below -> ce
 #                                degenerate C/S — this gate only rules out a broken certifier.
 BAG_FRAC = 0.8                 # D1: bootstrap size as a fraction of the eval fold
 GRAD_NORM_MIN = 1e-6           # below this RMS gradient magnitude the direction is degenerate -> None
+SINGULAR_REL_TOL = 1e-6        # discard numerically null Jacobian directions for rank>1 edits
 CLONE_COS_MAX = 1.0 - 1e-4     # evaluators more aligned than this are near-clones (bagging failed)
 
 
@@ -76,20 +77,27 @@ class EvaluatorQualityError(RuntimeError):
 # 2.1  Architecture-neutral candidate direction
 # ---------------------------------------------------------------------------
 
-def candidate_direction(
+def candidate_direction_details(
     probe,
     X_ref: torch.Tensor,
     device: torch.device,
     r: int = 1,
     batch_size: int = 512,
     grad_norm_min: float = GRAD_NORM_MIN,
-) -> torch.Tensor | None:
+    singular_rel_tol: float = SINGULAR_REL_TOL,
+) -> dict:
     """Top-`r` right-singular vectors of the per-example logit-difference
     Jacobian of `probe` over the fixed reference set `X_ref`.
 
-    Returns an orthonormal `(D, r)` basis `Q` (columns), or `None` if the
-    gradient field is degenerate (probe is ~flat). For a `LinearProbe` the
-    Jacobian rows are all equal to `w[1]-w[0]`, so `Q[:,0]` == normalize(w[1]-w[0]).
+    Returns a diagnostic dictionary containing an orthonormal basis `Q`, the
+    retained singular values, the requested/effective ranks, and the RMS
+    gradient magnitude. `Q` is `None` when the gradient field is degenerate.
+
+    Singular directions below `singular_rel_tol * s_max` are discarded. This
+    matters when a rank greater than one is requested: a linear probe has an
+    exactly rank-one Jacobian, and accepting the arbitrary null-space vectors
+    returned by an SVD would make a nominal rank-r intervention erase r-1
+    unrelated directions.
 
     Grad-enabled forward via `probe(xb)` — NOT `probe_logits` (which is
     @torch.no_grad, src/probes.py:328).
@@ -113,15 +121,58 @@ def candidate_direction(
     # RMS gradient magnitude — degeneracy guard independent of the SVD direction.
     g_rms = (G.pow(2).sum(dim=1).mean().sqrt()).item()
     if g_rms < grad_norm_min:
-        return None
+        return {
+            "Q": None,
+            "singular_values": [],
+            "requested_rank": int(r),
+            "effective_rank": 0,
+            "gradient_rms": float(g_rms),
+            "singular_rel_tol": float(singular_rel_tol),
+        }
 
     # Top-r right-singular vectors (directions in R^D capturing the dominant
     # gradient axis). Vh rows are orthonormal; QR is a defensive re-orthonormalize.
-    _, _, Vh = torch.linalg.svd(G, full_matrices=False)
-    r_eff = max(1, min(r, Vh.shape[0]))
+    _, singular_values, Vh = torch.linalg.svd(G, full_matrices=False)
+    requested = max(1, min(int(r), Vh.shape[0]))
+    threshold = float(singular_values[0]) * float(singular_rel_tol)
+    numerical_rank = int((singular_values > threshold).sum().item())
+    r_eff = min(requested, max(1, numerical_rank))
     D_c = Vh[:r_eff].T.contiguous()          # (D, r_eff)
     Q, _ = torch.linalg.qr(D_c)
-    return Q
+    return {
+        "Q": Q,
+        "singular_values": [float(v) for v in singular_values[:requested]],
+        "requested_rank": int(r),
+        "effective_rank": int(r_eff),
+        "gradient_rms": float(g_rms),
+        "singular_rel_tol": float(singular_rel_tol),
+    }
+
+
+def candidate_direction(
+    probe,
+    X_ref: torch.Tensor,
+    device: torch.device,
+    r: int = 1,
+    batch_size: int = 512,
+    grad_norm_min: float = GRAD_NORM_MIN,
+    singular_rel_tol: float = SINGULAR_REL_TOL,
+) -> torch.Tensor | None:
+    """Return only the retained candidate Jacobian basis.
+
+    This compatibility wrapper preserves the public WS5 API. Use
+    :func:`candidate_direction_details` in robustness studies that need to
+    report the effective rank or Jacobian singular values.
+    """
+    return candidate_direction_details(
+        probe,
+        X_ref,
+        device,
+        r=r,
+        batch_size=batch_size,
+        grad_norm_min=grad_norm_min,
+        singular_rel_tol=singular_rel_tol,
+    )["Q"]
 
 
 def candidate_projection(Q: torch.Tensor) -> torch.Tensor:

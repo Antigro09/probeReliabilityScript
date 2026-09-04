@@ -35,12 +35,15 @@ Accept licenses on:
 
 - SVA: place numpred.{train,val,test} in data/.
 - Gender agreement: data/gender.tsv (TAB-separated:
-  sentence  FEM|MASC  FEM_SKEW|MASC_SKEW), REQUIRED — generate it with
+  sentence  FEM|MASC  FEM_SKEW|MASC_SKEW), REQUIRED. The checked-in file
+  is the regenerated v2 dataset: 188 examples, full-sentence style,
+  occupation-referent Winogender templates, BLS skew thresholds
+  (%female ≥ 60 → FEM_SKEW, ≤ 40 → MASC_SKEW, NEUTRAL dropped); full
+  provenance in data/gender.provenance.json. To regenerate, run
   `python -m scripts.generate_gender_data` (see that script's docstring
-  for Winogender source options). The v1 synthetic fallback is deleted:
-  it silently produced sentences truncated before the pronoun, making the
-  task unlearnable, and the file currently in data/ is that broken v1
-  artifact (kept only for the v1 record; the v2 loader rejects it).
+  for Winogender source options). The v1 synthetic fallback is deleted —
+  it silently produced sentences truncated before the pronoun, making
+  the task unlearnable — and the v2 loader rejects any such artifact.
 - SST-2: optional data/sst2.tsv (TAB: sentence  0|1). If absent,
   loads from HuggingFace stanfordnlp/sst2.
 
@@ -58,6 +61,29 @@ python -m scripts.run_benchmark --config configs/tiny.yaml --task sva --k 2 --la
 ```
 
 If those pass, the system is healthy.
+
+## Post-registration robustness study
+
+The schema-v3 runner adds fresh post-edit decoders, orientation-robust metrics,
+matched baselines, grouped five-way splits, Hessian subspace diagnostics, and
+perturbation sweeps. It writes to a separate results directory and does not
+alter the preregistered schema-v2 outcome.
+
+```bash
+# One-model smoke test
+python -m scripts.ws9_robustness_sweep \
+  --models pythia --tasks sva --smoke --analyze
+
+# Full synthetic control grid, including the registered correlated condition
+python -m scripts.ws9_synthetic_controls
+
+# Full real-data robustness sweep
+python -m scripts.ws9_robustness_sweep \
+  --save-predictions --gender-pre-pronoun --analyze
+```
+
+See [docs/ROBUSTNESS_V3.md](docs/ROBUSTNESS_V3.md) for the estimands, split
+contract, output schema, and interpretation rules.
 
 ## Production: Per-Model Pipeline (Original Failure-Mode Analysis)
 

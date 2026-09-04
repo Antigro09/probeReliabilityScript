@@ -27,6 +27,13 @@ import torch.nn.functional as F
 from .probes import LinearProbe
 
 
+def _binary_linear_direction(probe: LinearProbe) -> torch.Tensor:
+    """Unit vector for the binary logit difference ``logit_1-logit_0``."""
+    weight = probe.linear.weight.detach()
+    direction = weight[1] - weight[0]
+    return direction / (direction.norm() + 1e-9)
+
+
 # ---------------------------------------------------------------------------
 # INLP
 # ---------------------------------------------------------------------------
@@ -66,9 +73,10 @@ def inlp_projection(
             acc = (preds == yd).float().mean().item()
         if acc < early_stop_acc:
             break
-        # Project out the discriminant direction
-        w = clf.linear.weight.detach().cpu()  # (2, D)
-        v = F.normalize(w[0:1], dim=1)         # (1, D)
+        # Project out the binary discriminant. A two-logit softmax depends on
+        # (w[1] - w[0])^T x; using w[0] alone is parameterization-dependent and
+        # need not remove the decision direction.
+        v = _binary_linear_direction(clf).cpu().unsqueeze(0)
         P_step = torch.eye(d) - v.T @ v
         P = P @ P_step
         Xc = Xc @ P_step
@@ -172,9 +180,7 @@ def apply_alterrep(
     For a binary linear probe with weight w, the discriminant direction
     is w[1] - w[0]. We shift each example by alpha * (sign-flip * unit_dir).
     """
-    w = validation_probe.linear.weight.detach()    # (2, D)
-    direction = (w[1] - w[0]).to(device)
-    direction = direction / (direction.norm() + 1e-9)
+    direction = _binary_linear_direction(validation_probe).to(device)
 
     Xd = X.to(device).float()
     zd = zc.to(device)
