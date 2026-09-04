@@ -834,15 +834,18 @@ def _cell_status_frame(cell: ConstructCell, error: BaseException) -> pd.DataFram
     )
 
 
+def _atomic_write_dataframe_csv(path: Path, frame: pd.DataFrame) -> None:
+    atomic_write_csv(path, frame.to_dict(orient="records"))
+
+
 def _persist_construct_failure_frame(
     failure_root: Path, failure_frame: pd.DataFrame
 ) -> None:
     atomic_write_parquet(
         failure_root / "construct_group_rows.failed.parquet", failure_frame
     )
-    atomic_write_csv(
-        failure_root / "construct_group_rows.failed.csv",
-        failure_frame.to_dict(orient="records"),
+    _atomic_write_dataframe_csv(
+        failure_root / "construct_group_rows.failed.csv", failure_frame
     )
 
 
@@ -1011,7 +1014,7 @@ def run_construct_panel(
     pilot = build_pilot_group_rows(_base_run_path(extension), base, extension.pilot)
     pilot_parquet, pilot_csv = _cell_group_paths(context.run_dir, extension.pilot)
     atomic_write_parquet(pilot_parquet, pilot)
-    atomic_write_csv(pilot_csv, pilot)
+    _atomic_write_dataframe_csv(pilot_csv, pilot)
     frames.insert(0, pilot)
     consolidated = pd.concat(frames, ignore_index=True, sort=False)
     validation = validate_construct_group_rows_without_inference(
@@ -1021,7 +1024,7 @@ def run_construct_panel(
     parquet_path = context.run_dir / _GROUP_ROWS_PARQUET
     csv_path = context.run_dir / _GROUP_ROWS_CSV
     atomic_write_parquet(parquet_path, consolidated)
-    atomic_write_csv(csv_path, consolidated)
+    _atomic_write_dataframe_csv(csv_path, consolidated)
     report = {
         "schema_version": 1,
         "status": "ok",
