@@ -285,10 +285,7 @@ In the disclosed \ConstructCell{} pilot, orientation calibration changed median 
 % END POST-RUN CONSTRUCT-PILOT-APPENDIX UPDATE
 
 \section{Reproducibility and assets}
-The anonymous code supplement is available at
-\href{https://anonymous.4open.science/r/Neurips-Code-Supplement-DE78}
-{this anonymous repository}.
-It contains source code, tests, locked specifications, registrations, environment-reconstruction manifests, and exact commands that regenerate the analyses, figures, and manuscript. Generated rows, checkpoints, figures, caches, and manuscript builds are intentionally excluded from Git; each run writes immutable, hash-verified artifacts to a timestamped local directory. The code is released under the MIT License. Model weights are not redistributed.
+An anonymized code-only reproduction archive accompanies this submission. It contains source code, tests, locked specifications, registrations, environment-reconstruction manifests, and exact commands that regenerate the analyses, figures, and manuscript. Generated rows, checkpoints, figures, caches, and manuscript builds are intentionally excluded from Git; each run writes immutable, hash-verified artifacts to a timestamped local directory. The code is released under the MIT License. Model weights are not redistributed.
 
 The submission run used one NVIDIA GeForce RTX~5070 GPU (12,227 MiB), an Intel Core i9-14900K CPU (32 logical cores), and 47.8 GiB RAM on Windows 11, with Python 3.13.5, PyTorch 2.12.0.dev20260408+cu128 (CUDA 12.8), and Transformers 5.7.0. Transformer extraction and the registered candidate MLP/Jacobian operations use the GPU; probes, edits, fresh decoders, bootstraps, and exact tests run on CPU. The run manifest records stage-level wall time, peak process memory, device selection, and storage use.
 
